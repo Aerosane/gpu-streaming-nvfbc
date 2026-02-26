@@ -1,0 +1,634 @@
+#!/usr/bin/env bash
+#───────────────────────────────────────────────────────────────
+# GPU Desktop Startup Script
+# Starts: NVIDIA Xorg → PulseAudio → KDE Plasma + KWin
+#         → Live Wallpaper → Brave GPU → Kitty/Apps → RAM Disk → Selkies
+# Usage: start
+#───────────────────────────────────────────────────────────────
+set -o pipefail
+
+export DISPLAY=:10
+export XDG_RUNTIME_DIR=/run/user/1000
+export XDG_SESSION_TYPE=x11
+export PULSE_SERVER="unix:/run/user/1000/pulse/native"
+export DENO_INSTALL="$HOME/.deno"
+export PATH="$DENO_INSTALL/bin:$PATH"
+
+RAMDISK_PATH="/mnt/ramdisk"
+RAMDISK_SIZE="50G"
+RAMDISK_SYNC_TARGET="/workspaces/codespace/.ramdisk-backup"
+SELKIES_PORT=8888
+TURN_CONFIG="$HOME/.turn-config.json"
+LOG_DIR="/tmp/gpu-desktop-logs"
+GST="/opt/gstreamer"
+LIVE_WALLPAPER="$HOME/.local/share/plasma/wallpapers/chainsaw-man.mp4"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
+ok()    { echo -e "${GREEN}[  OK]${NC}  $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+fail()  { echo -e "${RED}[FAIL]${NC}  $*"; }
+
+wait_for() {
+    local desc="$1" check="$2" max="${3:-15}"
+    for i in $(seq 1 "$max"); do
+        if eval "$check" &>/dev/null; then ok "$desc"; return 0; fi
+        sleep 1
+    done
+    fail "$desc (timed out after ${max}s)"
+    return 1
+}
+
+mkdir -p "$LOG_DIR"
+
+echo ""
+echo -e "${CYAN}╔══════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║        🖥️  GPU Desktop Startup Script        ║${NC}"
+echo -e "${CYAN}╚══════════════════════════════════════════════╝${NC}"
+echo ""
+
+#───────────────────────────────────────────────────────────────
+# 0. System Tuning (shm, swap, kernel params)
+#───────────────────────────────────────────────────────────────
+info "Tuning system for desktop stability..."
+
+# Expand /dev/shm from container default 64MB → 8GB (browsers need this)
+SHM_SIZE=$(df --output=size -m /dev/shm 2>/dev/null | tail -1 | tr -d ' ')
+if [ "${SHM_SIZE:-0}" -lt 1024 ]; then
+    sudo mount -o remount,size=8G /dev/shm 2>/dev/null
+    ok "/dev/shm expanded: ${SHM_SIZE}M → 8G"
+else
+    ok "/dev/shm already ${SHM_SIZE}M"
+fi
+
+# Create swap if none exists (safety net for memory spikes)
+if ! swapon --show 2>/dev/null | grep -q .; then
+    sudo fallocate -l 4G /tmp/swapfile 2>/dev/null \
+      && sudo chmod 600 /tmp/swapfile \
+      && sudo mkswap /tmp/swapfile &>/dev/null \
+      && sudo swapon /tmp/swapfile 2>/dev/null \
+      && ok "Swap: 4G created at /tmp/swapfile" \
+      || warn "Could not create swap"
+else
+    ok "Swap already active"
+fi
+
+# Kernel tuning for browser/desktop stability
+sudo sysctl -qw vm.swappiness=10 \
+  vm.max_map_count=262144 \
+  fs.inotify.max_user_watches=524288 \
+  fs.inotify.max_user_instances=1024 \
+  fs.file-max=2097152 2>/dev/null
+ok "Kernel tuned (swappiness=10, max_map=262144, inotify=524288)"
+
+# Network stack optimization (TCP buffers, BBR, busy poll, ring buffers)
+sudo sysctl -qw \
+  net.core.wmem_max=16777216 \
+  net.core.rmem_max=16777216 \
+  net.core.wmem_default=1048576 \
+  net.core.rmem_default=1048576 \
+  net.ipv4.tcp_rmem="4096 1048576 16777216" \
+  net.ipv4.tcp_wmem="4096 1048576 16777216" \
+  net.core.netdev_max_backlog=5000 \
+  net.core.busy_read=50 \
+  net.core.busy_poll=50 \
+  net.ipv4.tcp_fastopen=3 \
+  net.ipv4.tcp_mtu_probing=1 \
+  net.ipv4.tcp_slow_start_after_idle=0 \
+  net.ipv4.tcp_no_metrics_save=1 \
+  net.ipv4.tcp_congestion_control=bbr \
+  net.core.default_qdisc=fq 2>/dev/null
+sudo ethtool -G eth0 tx 2560 rx 18139 2>/dev/null
+ok "Network tuned (16MB buffers, BBR, busy_poll, TX ring 2560)"
+
+# DRM render node permissions (needed for headless Vulkan/EGL)
+if [ -e /dev/dri/renderD128 ]; then
+    sudo chmod 666 /dev/dri/renderD128 2>/dev/null
+    ok "DRM render node: /dev/dri/renderD128 (666)"
+fi
+
+# psutil needed by Selkies (lost on rebuild)
+pip install --break-system-packages -q psutil 2>/dev/null
+
+# Subpixel font rendering (lost on rebuild — /etc is not persistent)
+if ! grep -q "lcdfilter" /etc/fonts/local.conf 2>/dev/null; then
+    sudo tee /etc/fonts/local.conf > /dev/null << 'FONTCONF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+  <match target="font">
+    <edit name="rgba" mode="assign"><const>rgb</const></edit>
+  </match>
+  <match target="font">
+    <edit name="lcdfilter" mode="assign"><const>lcddefault</const></edit>
+  </match>
+  <match target="font">
+    <edit name="hinting" mode="assign"><bool>true</bool></edit>
+  </match>
+  <match target="font">
+    <edit name="hintstyle" mode="assign"><const>hintslight</const></edit>
+  </match>
+  <match target="font">
+    <edit name="antialias" mode="assign"><bool>true</bool></edit>
+  </match>
+  <match target="font">
+    <edit name="autohint" mode="assign"><bool>false</bool></edit>
+  </match>
+  <alias>
+    <family>sans-serif</family>
+    <prefer><family>Noto Sans</family></prefer>
+  </alias>
+  <alias>
+    <family>monospace</family>
+    <prefer><family>JetBrains Mono</family></prefer>
+  </alias>
+</fontconfig>
+FONTCONF
+    fc-cache -f 2>/dev/null
+    ok "Subpixel font rendering configured"
+else
+    ok "Font rendering already configured"
+fi
+
+#───────────────────────────────────────────────────────────────
+# 1. NVIDIA Check
+#───────────────────────────────────────────────────────────────
+info "Checking NVIDIA GPU..."
+if nvidia-smi -L &>/dev/null; then
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null)
+    ok "GPU: $GPU_NAME"
+else
+    fail "No NVIDIA GPU found. Aborting."
+    exit 1
+fi
+
+#───────────────────────────────────────────────────────────────
+# 2. NVIDIA Xorg on :10
+#───────────────────────────────────────────────────────────────
+info "Starting NVIDIA Xorg on $DISPLAY..."
+
+# Install xorg.conf with GPU accel options from repo (lost on rebuild)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/xorg.conf" ]; then
+    sudo cp "$SCRIPT_DIR/xorg.conf" /etc/X11/xorg.conf
+fi
+
+if [ -f /tmp/.X10-lock ]; then
+    ok "Xorg :10 already running"
+else
+    sudo Xorg :10 -config /etc/X11/xorg.conf \
+        -noreset +extension GLX +extension RANDR +extension RENDER \
+        vt7 &>"$LOG_DIR/xorg.log" &
+    wait_for "Xorg :10 started" "test -f /tmp/.X10-lock" 10
+fi
+
+# Verify OpenGL
+if DISPLAY=:10 glxinfo 2>/dev/null | grep -q "NVIDIA"; then
+    ok "OpenGL: $(DISPLAY=:10 glxinfo 2>/dev/null | grep 'OpenGL version' | sed 's/.*: //')"
+else
+    warn "OpenGL verification failed — check $LOG_DIR/xorg.log"
+fi
+
+# Apply Xrdb font settings (not persistent across restarts)
+xrdb -merge <<< "Xft.antialias: 1
+Xft.hinting: 1
+Xft.hintstyle: hintslight
+Xft.rgba: rgb
+Xft.lcdfilter: lcddefault
+Xft.dpi: 96"
+ok "Xrdb font rendering applied"
+
+# Add 144Hz modelines for common resolutions (Selkies resize will use these)
+for MODE_SPEC in \
+    "1920x876_144 259.20 1920 1928 1960 2000 876 879 884 900 +hsync -vsync" \
+    "1920x1080_144 325.08 1920 1928 1960 2000 1080 1083 1088 1130 +hsync -vsync" \
+    "2560x1440_144 587.59 2560 2568 2600 2640 1440 1443 1448 1553 +hsync -vsync"; do
+    xrandr --newmode $MODE_SPEC 2>/dev/null || true
+    MODE_NAME="${MODE_SPEC%% *}"
+    xrandr --addmode DVI-D-0 "$MODE_NAME" 2>/dev/null || true
+done
+ok "144Hz modelines added (876p/1080p/1440p)"
+
+#───────────────────────────────────────────────────────────────
+# 3. PulseAudio + Selkies Audio Sink (BEFORE Plasma so it gets PULSE_SERVER)
+#───────────────────────────────────────────────────────────────
+info "Starting PulseAudio..."
+if pulseaudio --check 2>/dev/null; then
+    ok "PulseAudio already running"
+else
+    rm -f /run/user/1000/pulse/pid /run/user/1000/pulse/native 2>/dev/null
+    mkdir -p /run/user/1000/pulse
+
+    # Unset PULSE_SERVER during startup so pulseaudio creates its own socket
+    _saved_ps="$PULSE_SERVER"
+    unset PULSE_SERVER
+
+    # Write client config BEFORE starting
+    sudo mkdir -p /etc/pulse
+    cat > /tmp/pulse-client.conf << 'PULSECONF'
+default-server = unix:/run/user/1000/pulse/native
+autospawn = no
+PULSECONF
+    sudo cp /tmp/pulse-client.conf /etc/pulse/client.conf
+    rm -f /tmp/pulse-client.conf
+
+    pulseaudio -D --exit-idle-time=-1 2>/dev/null
+    wait_for "PulseAudio started" "pulseaudio --check" 5
+
+    # Restore PULSE_SERVER now that the socket exists
+    export PULSE_SERVER="$_saved_ps"
+fi
+
+# Symlink for apps that look in /run/pulse
+sudo mkdir -p /run/pulse
+sudo ln -sf /run/user/1000/pulse/native /run/pulse/native 2>/dev/null
+
+# Create Selkies audio sink
+if ! pactl list sinks short 2>/dev/null | grep -q selkies_stream; then
+    info "Creating Selkies audio sink..."
+    pactl load-module module-null-sink sink_name=selkies_stream \
+        sink_properties=device.description=Selkies_Stream_Audio &>/dev/null
+    ok "Audio sink: selkies_stream"
+else
+    ok "Audio sink already exists"
+fi
+pactl set-default-sink selkies_stream 2>/dev/null
+pactl set-default-source selkies_stream.monitor 2>/dev/null
+
+#───────────────────────────────────────────────────────────────
+# 4. DBus Session
+#───────────────────────────────────────────────────────────────
+info "Setting up DBus session..."
+EXISTING_DBUS=""
+for pid in $(pgrep -u "$(whoami)" "plasmashell|kwin_x11|kded5" 2>/dev/null); do
+    EXISTING_DBUS=$(cat /proc/"$pid"/environ 2>/dev/null | tr '\0' '\n' | grep DBUS_SESSION_BUS_ADDRESS | head -1)
+    [ -n "$EXISTING_DBUS" ] && break
+done
+
+if [ -n "$EXISTING_DBUS" ]; then
+    export "$EXISTING_DBUS"
+    ok "Reusing existing DBus"
+else
+    eval "$(dbus-launch --sh-syntax)"
+    ok "New DBus session started"
+fi
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}"
+
+#───────────────────────────────────────────────────────────────
+# 5. KDE Plasma Desktop
+#───────────────────────────────────────────────────────────────
+info "Starting KDE Plasma desktop..."
+if pgrep -u "$(whoami)" plasmashell &>/dev/null; then
+    ok "KDE Plasma already running"
+else
+    # Disable screen lock
+    kwriteconfig5 --file kscreenlockerrc --group Daemon --key Autolock false
+    kwriteconfig5 --file kscreenlockerrc --group Daemon --key LockOnResume false
+    kwriteconfig5 --file kscreenlockerrc --group Daemon --key Timeout 0
+
+    setsid startplasma-x11 &>"$LOG_DIR/plasma.log" &
+    disown
+    wait_for "KDE Plasma started" "pgrep -u $(whoami) plasmashell" 15
+
+    # Re-read DBUS from the new Plasma session
+    sleep 2
+    for pid in $(pgrep -u "$(whoami)" "plasmashell|kwin_x11|kded5" 2>/dev/null); do
+        NEW_DBUS=$(cat /proc/"$pid"/environ 2>/dev/null | tr '\0' '\n' | grep DBUS_SESSION_BUS_ADDRESS | head -1)
+        if [ -n "$NEW_DBUS" ]; then
+            export "$NEW_DBUS"
+            break
+        fi
+    done
+fi
+
+#───────────────────────────────────────────────────────────────
+# 6. KWin Effects Configuration
+#───────────────────────────────────────────────────────────────
+info "Configuring KWin compositor effects..."
+# Configure effects (startplasma-x11 already launches kwin_x11)
+kwriteconfig5 --file kwinrc --group Compositing --key Backend OpenGL
+kwriteconfig5 --file kwinrc --group Compositing --key Enabled true
+kwriteconfig5 --file kwinrc --group Compositing --key OpenGLIsUnsafe false
+kwriteconfig5 --file kwinrc --group Compositing --key GLPreferBufferSwap a
+kwriteconfig5 --file kwinrc --group Compositing --key MaxFPS 144
+kwriteconfig5 --file kwinrc --group Compositing --key RefreshRate 144
+kwriteconfig5 --file kwinrc --group Compositing --key LatencyPolicy Low
+kwriteconfig5 --file kwinrc --group Compositing --key RenderTimeEstimator Minimum
+kwriteconfig5 --file kwinrc --group Compositing --key HiddenPreviews 5
+kwriteconfig5 --file kwinrc --group Compositing --key UnredirectFullscreen true
+kwriteconfig5 --file kwinrc --group Plugins --key wobblywindowsEnabled true
+kwriteconfig5 --file kwinrc --group Plugins --key slideEnabled true
+kwriteconfig5 --file kwinrc --group Plugins --key magiclampEnabled true
+
+# KDE font rendering
+kwriteconfig5 --file kdeglobals --group General --key XftAntialias true
+kwriteconfig5 --file kdeglobals --group General --key XftHintStyle hintslight
+kwriteconfig5 --file kdeglobals --group General --key XftSubPixel rgb
+kwriteconfig5 --file kdeglobals --group General --key forceFontDPI 96
+
+if pgrep -u "$(whoami)" kwin_x11 &>/dev/null; then
+    # Reload effects on already-running kwin
+    qdbus org.kde.KWin /KWin org.kde.KWin.reconfigure 2>/dev/null
+    ok "KWin effects reloaded (wobbly, slide, magic lamp)"
+else
+    # Fallback: start kwin if plasma didn't (shouldn't happen)
+    setsid kwin_x11 --no-kactivities &>"$LOG_DIR/kwin.log" &
+    disown
+    wait_for "KWin compositor started" "pgrep -u $(whoami) kwin_x11" 8
+fi
+
+#───────────────────────────────────────────────────────────────
+# 7. Live Video Wallpaper (Plasma native via org.kde.video)
+#───────────────────────────────────────────────────────────────
+info "Setting up live wallpaper..."
+if [ -f "$LIVE_WALLPAPER" ]; then
+    # Install video wallpaper plugin if missing
+    if [ ! -d "$HOME/.local/share/plasma/wallpapers/org.kde.video" ]; then
+        if [ -d "/tmp/org.kde.video" ]; then
+            mkdir -p "$HOME/.local/share/plasma/wallpapers"
+            cp -r /tmp/org.kde.video "$HOME/.local/share/plasma/wallpapers/org.kde.video"
+        fi
+    fi
+
+    if [ -d "$HOME/.local/share/plasma/wallpapers/org.kde.video" ]; then
+        qdbus org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "
+          var allDesktops = desktops();
+          for (var i = 0; i < allDesktops.length; i++) {
+            var d = allDesktops[i];
+            d.wallpaperPlugin = 'org.kde.video';
+            d.currentConfigGroup = Array('Wallpaper', 'org.kde.video', 'General');
+            d.writeConfig('Video', 'file://${LIVE_WALLPAPER}');
+            d.writeConfig('Muted', true);
+            d.writeConfig('Rate', 1.0);
+          }
+        " 2>/dev/null && ok "Live wallpaper: $(basename "$LIVE_WALLPAPER")" \
+                       || warn "Could not set video wallpaper via Plasma"
+    else
+        warn "org.kde.video plugin not installed — skipping live wallpaper"
+    fi
+else
+    warn "No wallpaper video at $LIVE_WALLPAPER — skipping"
+fi
+
+#───────────────────────────────────────────────────────────────
+# 8. Brave Browser GPU Flags
+#───────────────────────────────────────────────────────────────
+info "Configuring Brave browser GPU flags..."
+mkdir -p "$HOME/.config"
+cat > "$HOME/.config/brave-flags.conf" << 'BRAVEFLAGS'
+--ozone-platform=x11
+--use-gl=egl
+--enable-features=VaapiVideoDecodeLinuxGL,VaapiIgnoreDriverChecks
+--enable-gpu-rasterization
+--enable-zero-copy
+--ignore-gpu-blocklist
+--disable-dev-shm-usage
+--disable-background-timer-throttling
+--disable-renderer-backgrounding
+--disable-backgrounding-occluded-windows
+BRAVEFLAGS
+ok "Brave GPU flags: EGL + HW decode + stability"
+
+#───────────────────────────────────────────────────────────────
+# 9. Kitty GPU Terminal + Apps
+#───────────────────────────────────────────────────────────────
+info "Configuring GPU-accelerated apps..."
+
+# Kitty terminal config
+mkdir -p ~/.config/kitty
+if [ ! -f ~/.config/kitty/kitty.conf ]; then
+    cat > ~/.config/kitty/kitty.conf << 'KITTYCONF'
+gpu_rendering yes
+font_size 11.0
+repaint_delay 8
+input_delay 1
+sync_to_monitor yes
+background_opacity 0.92
+dynamic_background_opacity yes
+window_padding_width 4
+confirm_os_window_close 0
+enable_audio_bell no
+scrollback_lines 10000
+KITTYCONF
+fi
+
+# Kitty desktop shortcut
+if [ ! -f ~/Desktop/kitty.desktop ]; then
+    cat > ~/Desktop/kitty.desktop << 'KITTYDESK'
+[Desktop Entry]
+Name=Kitty (GPU Terminal)
+Exec=env DISPLAY=:10 kitty
+Icon=kitty
+Type=Application
+Terminal=false
+KITTYDESK
+    chmod +x ~/Desktop/kitty.desktop
+fi
+ok "Kitty GPU terminal configured"
+
+#───────────────────────────────────────────────────────────────
+# 10. RAM Disk with Periodic Sync
+#───────────────────────────────────────────────────────────────
+info "Setting up RAM disk (${RAMDISK_SIZE} at ${RAMDISK_PATH})..."
+if mountpoint -q "$RAMDISK_PATH" 2>/dev/null; then
+    ok "RAM disk already mounted at $RAMDISK_PATH"
+else
+    sudo mkdir -p "$RAMDISK_PATH"
+    sudo mount -t tmpfs -o "size=${RAMDISK_SIZE},mode=1777" tmpfs "$RAMDISK_PATH"
+    ok "RAM disk mounted: $RAMDISK_SIZE at $RAMDISK_PATH"
+fi
+
+# Restore from backup if exists
+if [ -d "$RAMDISK_SYNC_TARGET" ] && [ "$(ls -A "$RAMDISK_SYNC_TARGET" 2>/dev/null)" ]; then
+    info "Restoring RAM disk from backup..."
+    rsync -a --quiet "$RAMDISK_SYNC_TARGET/" "$RAMDISK_PATH/"
+    ok "RAM disk restored from $RAMDISK_SYNC_TARGET"
+fi
+
+# Start periodic sync (every 5 minutes)
+SYNC_PIDFILE="/tmp/ramdisk-sync.pid"
+if [ -f "$SYNC_PIDFILE" ] && [ -d "/proc/$(cat "$SYNC_PIDFILE" 2>/dev/null)" ]; then
+    ok "RAM disk sync already running (PID $(cat "$SYNC_PIDFILE"))"
+else
+    rm -f "$SYNC_PIDFILE"
+    mkdir -p "$RAMDISK_SYNC_TARGET"
+    (
+        while true; do
+            sleep 300
+            if mountpoint -q "$RAMDISK_PATH" 2>/dev/null && [ "$(ls -A "$RAMDISK_PATH" 2>/dev/null)" ]; then
+                rsync -a --delete --quiet "$RAMDISK_PATH/" "$RAMDISK_SYNC_TARGET/" 2>/dev/null
+            fi
+        done
+    ) &
+    echo $! > "$SYNC_PIDFILE"
+    disown
+    ok "RAM disk sync started (every 5min → $RAMDISK_SYNC_TARGET)"
+fi
+
+#───────────────────────────────────────────────────────────────
+# 10b. Hot-Path Acceleration (copy heavy apps to RAMDISK)
+#───────────────────────────────────────────────────────────────
+info "Accelerating hot paths to RAMDISK..."
+
+# DaVinci Resolve: 6.5GB → RAMDISK via bind mount
+if [ -d /opt/resolve/bin ] && mountpoint -q "$RAMDISK_PATH"; then
+    if mountpoint -q /opt/resolve 2>/dev/null; then
+        ok "DaVinci already on RAMDISK"
+    else
+        AVAIL_MB=$(df --output=avail -m "$RAMDISK_PATH" | tail -1 | tr -d ' ')
+        RESOLVE_MB=$(du -sm /opt/resolve 2>/dev/null | awk '{print $1}')
+        NEED_MB=$((RESOLVE_MB + 2048))  # keep 2GB headroom
+
+        if [ "${AVAIL_MB:-0}" -ge "$NEED_MB" ]; then
+            info "Copying DaVinci Resolve (${RESOLVE_MB}MB) to RAMDISK..."
+            mkdir -p "$RAMDISK_PATH/resolve"
+            cp -a /opt/resolve/. "$RAMDISK_PATH/resolve/"
+            sudo mount --bind "$RAMDISK_PATH/resolve" /opt/resolve
+            ok "DaVinci on RAMDISK (${RESOLVE_MB}MB → 3.7 GB/s reads)"
+        else
+            warn "Not enough RAMDISK space for DaVinci (need ${NEED_MB}MB, have ${AVAIL_MB}MB) — using SSD"
+        fi
+    fi
+fi
+
+# DaVinci cache/project data → RAMDISK
+RESOLVE_DATA="$HOME/.local/share/DaVinciResolve"
+if [ -d "$RESOLVE_DATA" ] && mountpoint -q "$RAMDISK_PATH"; then
+    if mountpoint -q "$RESOLVE_DATA" 2>/dev/null; then
+        ok "DaVinci data already on RAMDISK"
+    else
+        mkdir -p "$RAMDISK_PATH/resolve-data"
+        cp -a "$RESOLVE_DATA/." "$RAMDISK_PATH/resolve-data/"
+        sudo mount --bind "$RAMDISK_PATH/resolve-data" "$RESOLVE_DATA"
+        ok "DaVinci cache/projects on RAMDISK"
+    fi
+fi
+
+# Periodic sync: RAMDISK → SSD every 30s (protect against data loss)
+HOTPATH_PIDFILE="/tmp/hotpath-sync.pid"
+if [ -f "$HOTPATH_PIDFILE" ] && [ -d "/proc/$(cat "$HOTPATH_PIDFILE" 2>/dev/null)" ]; then
+    ok "Hot-path sync already running (PID $(cat "$HOTPATH_PIDFILE"))"
+else
+    rm -f "$HOTPATH_PIDFILE"
+    (
+        DATA_DST="$RAMDISK_PATH/resolve-data"
+        SSD_DATA_BAK="/workspaces/codespace/.resolve-sync/data"
+        SSD_RESOLVE_BAK="/workspaces/codespace/.resolve-sync/install"
+        mkdir -p "$SSD_DATA_BAK" "$SSD_RESOLVE_BAK"
+        while true; do
+            sleep 30
+            # Sync DaVinci data (projects/cache — most important)
+            if mountpoint -q "$HOME/.local/share/DaVinciResolve" 2>/dev/null; then
+                rsync -a --delete --quiet "$DATA_DST/" "$SSD_DATA_BAK/" 2>/dev/null
+            fi
+            # Sync DaVinci install (plugins/configs may change)
+            if mountpoint -q /opt/resolve 2>/dev/null; then
+                rsync -a --delete --quiet "$RAMDISK_PATH/resolve/" "$SSD_RESOLVE_BAK/" 2>/dev/null
+            fi
+        done
+    ) &
+    echo $! > "$HOTPATH_PIDFILE"
+    disown
+    ok "Hot-path sync started (every 30s → SSD backup)"
+fi
+
+#───────────────────────────────────────────────────────────────
+# 11. Selkies-GStreamer Streaming
+#───────────────────────────────────────────────────────────────
+info "Starting Selkies-GStreamer on port $SELKIES_PORT..."
+if pgrep -f selkies-gstreamer &>/dev/null; then
+    ok "Selkies already running"
+else
+    # Get TURN credentials and write rtc.json for WebRTC
+    TURN_ARGS=""
+    RTC_JSON="/tmp/rtc.json"
+    if [ -f "$TURN_CONFIG" ]; then
+        TURN_ID=$(jq -r '.turn_token_id' "$TURN_CONFIG" 2>/dev/null)
+        API_TOKEN=$(jq -r '.turn_api_token' "$TURN_CONFIG" 2>/dev/null)
+        if [ -n "$TURN_ID" ] && [ "$TURN_ID" != "null" ]; then
+            info "Refreshing Cloudflare TURN credentials..."
+            TURN_RESP=$(curl -sf "https://rtc.live.cloudflare.com/v1/turn/keys/${TURN_ID}/credentials/generate" \
+                -H "Authorization: Bearer ${API_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d '{"ttl": 86400}' 2>/dev/null || echo "{}")
+            TURN_USER=$(echo "$TURN_RESP" | jq -r '.iceServers.username' 2>/dev/null)
+            TURN_PASS=$(echo "$TURN_RESP" | jq -r '.iceServers.credential' 2>/dev/null)
+            TURN_URLS=$(echo "$TURN_RESP" | jq -c '.iceServers.urls' 2>/dev/null)
+            if [ -n "$TURN_USER" ] && [ "$TURN_USER" != "null" ]; then
+                # Write rtc.json with full ICE server list (STUN + TURN)
+                python3 -c "
+import json, sys
+resp = json.loads('''$TURN_RESP''')
+ice = resp.get('iceServers', {})
+rtc = {
+    'lifetimeDuration': '86400s',
+    'iceServers': [{
+        'urls': ice.get('urls', []),
+        'username': ice.get('username', ''),
+        'credential': ice.get('credential', '')
+    }]
+}
+json.dump(rtc, open('$RTC_JSON', 'w'))
+" 2>/dev/null
+                TURN_ARGS="--turn_host=turn.cloudflare.com --turn_port=3478 --turn_username=$TURN_USER --turn_password=$TURN_PASS --turn_protocol=udp"
+                ok "TURN credentials acquired (24h TTL) → $RTC_JSON"
+            else
+                warn "TURN credential refresh failed — streaming without relay"
+            fi
+        fi
+    else
+        warn "No TURN config at $TURN_CONFIG — streaming without relay"
+    fi
+
+    setsid env \
+        DISPLAY=:10 \
+        XDG_RUNTIME_DIR=/run/user/1000 \
+        PULSE_SERVER="unix:/run/user/1000/pulse/native" \
+        DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+        PATH="${GST}/bin:${PATH}" \
+        LD_LIBRARY_PATH="${GST}/lib/x86_64-linux-gnu" \
+        GST_PLUGIN_PATH="${GST}/lib/x86_64-linux-gnu/gstreamer-1.0" \
+        GST_PLUGIN_SYSTEM_PATH="${HOME}/.local/share/gstreamer-1.0/plugins:/usr/lib/x86_64-linux-gnu/gstreamer-1.0" \
+        GI_TYPELIB_PATH="${GST}/lib/x86_64-linux-gnu/girepository-1.0:/usr/lib/x86_64-linux-gnu/girepository-1.0" \
+        PYTHONPATH="${GST}/lib/python3/dist-packages" \
+        selkies-gstreamer \
+            --addr=0.0.0.0 --port="$SELKIES_PORT" \
+            --web_root=/opt/selkies-web/gst-web \
+            --enable_resize=true --framerate=144 --video_bitrate=8000 \
+            --encoder=nvh264enc \
+            --enable_basic_auth=false \
+            --rtc_config_json="$RTC_JSON" \
+            $TURN_ARGS \
+            &>"$LOG_DIR/selkies.log" &
+    disown
+    wait_for "Selkies responding on :$SELKIES_PORT" \
+        "curl -sf -o /dev/null http://localhost:$SELKIES_PORT/" 10 || true
+fi
+
+#───────────────────────────────────────────────────────────────
+# Status Summary
+#───────────────────────────────────────────────────────────────
+echo ""
+echo -e "${CYAN}╔══════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║            🎮  Stack Status                  ║${NC}"
+echo -e "${CYAN}╠══════════════════════════════════════════════╣${NC}"
+chk() { eval "$2" &>/dev/null && echo -e "║ ${GREEN}✅${NC} $1" || echo -e "║ ${RED}❌${NC} $1"; }
+chk "System Tuning (shm/swap/kern)" "test $(df --output=size -m /dev/shm 2>/dev/null | tail -1 | tr -d ' ') -ge 1024"
+chk "NVIDIA Xorg :10              " "test -f /tmp/.X10-lock"
+chk "PulseAudio (selkies_stream)  " "pulseaudio --check"
+chk "KDE Plasma Shell             " "pgrep -u $(whoami) plasmashell"
+chk "KWin Compositor              " "pgrep -u $(whoami) kwin_x11"
+chk "Live Wallpaper               " "test -f $LIVE_WALLPAPER"
+chk "Brave GPU Config             " "test -f $HOME/.config/brave-flags.conf"
+chk "RAM Disk ($RAMDISK_PATH)     " "mountpoint -q $RAMDISK_PATH"
+chk "RAM Disk Sync (5min)         " "test -f $SYNC_PIDFILE && test -d /proc/\$(cat $SYNC_PIDFILE 2>/dev/null)"
+chk "DaVinci on RAMDISK           " "mountpoint -q /opt/resolve"
+chk "Selkies Stream :$SELKIES_PORT        " "pgrep -f selkies-gstreamer"
+echo -e "${CYAN}╠══════════════════════════════════════════════╣${NC}"
+echo -e "║ 🎨 KWin: ${GREEN}wobbly windows${NC} | ${GREEN}slide${NC} | ${GREEN}magic lamp${NC}"
+echo -e "║ 🌐 Stream: ${GREEN}https://\$(hostname)-${SELKIES_PORT}.app.github.dev/${NC}"
+echo -e "║ 📁 RAM Disk: ${GREEN}$RAMDISK_PATH${NC} (${RAMDISK_SIZE})"
+echo -e "║ 🔊 Audio: ${GREEN}PulseAudio → Selkies OPUS → Browser${NC}"
+echo -e "║ 📋 Logs: ${GREEN}$LOG_DIR/${NC}"
+echo -e "${CYAN}╚══════════════════════════════════════════════╝${NC}"
+echo ""
