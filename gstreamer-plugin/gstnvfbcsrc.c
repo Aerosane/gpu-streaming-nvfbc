@@ -13,7 +13,7 @@
  *   NvFBC grabs frame → CUdeviceptr in VRAM
  *   gst_cuda_allocator_alloc_wrapped() wraps it as GstCudaMemory (once, cached)
  *   Push downstream — encoder reads DIRECTLY from NvFBC's VRAM buffer
- *   BLOCKING grab (NOFLAGS) — sleeps in kernel, zero CPU while idle
+ *   NOWAIT grab (skips duplicate frames) — sleeps in kernel, zero CPU while idle
  */
 
 #include <gst/gst.h>
@@ -25,7 +25,7 @@
 
 #include <dlfcn.h>
 #include <string.h>
-#include "/tmp/NvFBC.h"
+#include "NvFBC.h"
 #include <cuda.h>
 
 GST_DEBUG_CATEGORY_STATIC(nvfbcsrc_debug);
@@ -77,7 +77,7 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS(
         "video/x-raw(memory:CUDAMemory), "
-        "format = (string) BGRx, "
+        "format = (string) BGRA, "
         "framerate = (fraction) [1/1, 240/1], "
         "width = (int) [1, 7680], "
         "height = (int) [1, 4320]"
@@ -243,7 +243,7 @@ static gboolean create_capture_session(GstNvfbcSrc *self) {
     CUcontext d;
     CuCtxPopCurrent(&d);
 
-    gst_video_info_set_format(&self->video_info, GST_VIDEO_FORMAT_BGRx,
+    gst_video_info_set_format(&self->video_info, GST_VIDEO_FORMAT_BGRA,
                               self->width, self->height);
 
     self->session_active = TRUE;
@@ -304,7 +304,7 @@ static GstCaps *gst_nvfbc_src_get_caps(GstBaseSrc *basesrc, GstCaps *filter) {
     }
 
     GstCaps *cuda_caps = gst_caps_new_simple("video/x-raw",
-        "format", G_TYPE_STRING, "BGRx",
+        "format", G_TYPE_STRING, "BGRA",
         "width", G_TYPE_INT, self->width,
         "height", G_TYPE_INT, self->height,
         NULL);
@@ -468,12 +468,12 @@ static GstFlowReturn gst_nvfbc_src_create(GstPushSrc *pushsrc, GstBuffer **buf) 
         }
 
         /* Update video info */
-        gst_video_info_set_format(&self->video_info, GST_VIDEO_FORMAT_BGRx,
+        gst_video_info_set_format(&self->video_info, GST_VIDEO_FORMAT_BGRA,
                                   self->width, self->height);
 
         /* Force caps renegotiation with CUDAMemory feature */
         GstCaps *new_caps = gst_caps_new_simple("video/x-raw",
-                "format", G_TYPE_STRING, "BGRx",
+                "format", G_TYPE_STRING, "BGRA",
                 "width", G_TYPE_INT, self->width,
                 "height", G_TYPE_INT, self->height,
                 NULL);
