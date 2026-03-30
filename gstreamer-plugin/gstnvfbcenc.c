@@ -413,8 +413,7 @@ static gboolean gst_nvfbc_enc_start(GstBaseSrc *base) {
     /* Create and push CUDA context before NvFBC setup */
     CUdevice dev;
     cuDeviceGet(&dev, 0);
-    CUctxCreateParams ctxParams = {0};
-    CUresult cures = cuCtxCreate(&self->cu_ctx, &ctxParams, 0, dev);
+    CUresult cures = cuCtxCreate(&self->cu_ctx, 0, dev);
     if (cures != CUDA_SUCCESS) {
         /* Try getting existing context */
         cures = cuCtxGetCurrent(&self->cu_ctx);
