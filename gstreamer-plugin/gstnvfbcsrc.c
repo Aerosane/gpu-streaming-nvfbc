@@ -449,9 +449,79 @@ static GstFlowReturn gst_nvfbc_src_create(GstPushSrc *pushsrc, GstBuffer **buf) 
 
     NVFBCSTATUS status = self->fbc_fn.nvFBCToCudaGrabFrame(self->fbc_handle, &grabParams);
     if (status != NVFBC_SUCCESS) {
-        GST_ERROR_OBJECT(self, "NvFBCToCudaGrabFrame failed: %d — %s",
+        GST_WARNING_OBJECT(self, "NvFBCToCudaGrabFrame failed: %d — %s (retrying...)",
             status, self->fbc_fn.nvFBCGetLastErrorStr(self->fbc_handle));
-        return GST_FLOW_ERROR;
+
+        /* Retry: destroy session + handle, recreate from scratch */
+        for (int retry = 0; retry < 10; retry++) {
+            g_usleep(500000); /* 500ms between retries */
+
+            /* Tear down everything */
+            if (self->session_active && self->fbc_fn.nvFBCDestroyCaptureSession) {
+                NVFBC_DESTROY_CAPTURE_SESSION_PARAMS dp;
+                memset(&dp, 0, sizeof(dp));
+                dp.dwVersion = NVFBC_DESTROY_CAPTURE_SESSION_PARAMS_VER;
+                self->fbc_fn.nvFBCDestroyCaptureSession(self->fbc_handle, &dp);
+                self->session_active = FALSE;
+            }
+            if (self->fbc_fn.nvFBCDestroyHandle && self->fbc_handle) {
+                NVFBC_DESTROY_HANDLE_PARAMS dhp;
+                memset(&dhp, 0, sizeof(dhp));
+                dhp.dwVersion = NVFBC_DESTROY_HANDLE_PARAMS_VER;
+                self->fbc_fn.nvFBCDestroyHandle(self->fbc_handle, &dhp);
+                self->fbc_handle = 0;
+            }
+            self->context_bound = FALSE;
+            if (self->cached_mem) {
+                gst_memory_unref(self->cached_mem);
+                self->cached_mem = NULL;
+            }
+
+            /* Recreate handle + session */
+            if (!ensure_fbc_handle(self)) {
+                GST_WARNING_OBJECT(self, "Retry %d: handle creation failed", retry + 1);
+                continue;
+            }
+            if (!query_screen_size(self)) {
+                GST_WARNING_OBJECT(self, "Retry %d: query_screen_size failed", retry + 1);
+                continue;
+            }
+            if (!create_capture_session(self)) {
+                GST_WARNING_OBJECT(self, "Retry %d: session creation failed", retry + 1);
+                continue;
+            }
+
+            /* Re-bind context */
+            if (self->fbc_fn.nvFBCBindContext) {
+                NVFBC_BIND_CONTEXT_PARAMS bp;
+                memset(&bp, 0, sizeof(bp));
+                bp.dwVersion = NVFBC_BIND_CONTEXT_PARAMS_VER;
+                self->fbc_fn.nvFBCBindContext(self->fbc_handle, &bp);
+            }
+            gst_cuda_context_push(self->cuda_ctx);
+            self->context_bound = TRUE;
+
+            /* Try grab again */
+            fbc_ptr = 0;
+            memset(&grabInfo, 0, sizeof(grabInfo));
+            memset(&grabParams, 0, sizeof(grabParams));
+            grabParams.dwVersion = NVFBC_TOCUDA_GRAB_FRAME_PARAMS_VER;
+            grabParams.dwFlags = NVFBC_TOCUDA_GRAB_FLAGS_NOFLAGS;
+            grabParams.pCUDADeviceBuffer = &fbc_ptr;
+            grabParams.pFrameGrabInfo = &grabInfo;
+            grabParams.dwTimeoutMs = 100;
+
+            status = self->fbc_fn.nvFBCToCudaGrabFrame(self->fbc_handle, &grabParams);
+            if (status == NVFBC_SUCCESS) {
+                GST_WARNING_OBJECT(self, "NvFBC recovered after %d retries!", retry + 1);
+                break;
+            }
+            GST_WARNING_OBJECT(self, "Retry %d: grab still failing (%d)", retry + 1, status);
+        }
+        if (status != NVFBC_SUCCESS) {
+            GST_ERROR_OBJECT(self, "NvFBC unrecoverable after 10 retries");
+            return GST_FLOW_ERROR;
+        }
     }
 
     /* Detect resolution change (xrandr resize while capturing) */
