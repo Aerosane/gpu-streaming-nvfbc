@@ -154,7 +154,7 @@ var app = new Vue({
             resizeRemote: true,
             scaleLocal: false,
             debug: false,
-            turnSwitch: true,
+            turnSwitch: false,
             publishingAllowed: false,
             publishingIdle: false,
             publishingError: "",
@@ -348,7 +348,7 @@ var app = new Vue({
 app.debug = app.getBoolParam("debug", false);
 
 // Fetch turn setting
-app.turnSwitch = app.getBoolParam("turnSwitch", true);
+app.turnSwitch = app.getBoolParam("turnSwitch", false);
 
 // Fetch scale local settings
 app.scaleLocal = app.getBoolParam("scaleLocal", !app.resizeRemote);

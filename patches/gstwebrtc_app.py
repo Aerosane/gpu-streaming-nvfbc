@@ -168,7 +168,7 @@ class GSTWebRTCApp:
 
         # Force relay-only ICE to use TURN server's optimized backbone
         # Direct srflx path has 5%+ packet loss (Azure NAT → Indian ISP congestion)
-        self.webrtcbin.set_property("ice-transport-policy", "relay")
+        self.webrtcbin.set_property("ice-transport-policy", "all")
 
         # Set default jitterbuffer latency to the minimum possible
         self.webrtcbin.set_property("latency", 0)
