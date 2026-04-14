@@ -220,11 +220,15 @@ def parse_rtc_config(data):
                 turn_port = url.split(':')[2].split('?')[0]
                 turn_user = ice_server['username']
                 turn_password = ice_server['credential']
-                turn_uri = "turns://%s:%s@%s:%s" % (
+                transport_param = ""
+                if '?' in url:
+                    transport_param = "?" + url.split('?', 1)[1]
+                turn_uri = "turns://%s:%s@%s:%s%s" % (
                     urllib.parse.quote(turn_user, safe=""),
                     urllib.parse.quote(turn_password, safe=""),
                     turn_host,
-                    turn_port
+                    turn_port,
+                    transport_param
                 )
                 turn_uris.append(turn_uri)
     return stun_uris, turn_uris, data

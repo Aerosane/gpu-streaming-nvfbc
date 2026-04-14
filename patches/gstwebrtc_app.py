@@ -380,12 +380,9 @@ class GSTWebRTCApp:
                 # Insert sequence headers (SPS/PPS) per IDR
                 nvh264enc.set_property("repeat-sequence-header", True)
             if Gst.version().major == 1 and Gst.version().minor > 22:
-                nvh264enc.set_property("preset", "p4")
+                nvh264enc.set_property("preset", "p1")
                 nvh264enc.set_property("tune", "ultra-low-latency")
-                # Two-pass mode allows to detect more motion vectors,
-                # better distribute bitrate across the frame
-                # and more strictly adhere to bitrate limits.
-                nvh264enc.set_property("multi-pass", "two-pass-quarter")
+                nvh264enc.set_property("multi-pass", "disabled")
             else:
                 nvh264enc.set_property("preset", "low-latency-hq")
 
