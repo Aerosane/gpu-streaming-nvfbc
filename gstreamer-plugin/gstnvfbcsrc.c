@@ -324,6 +324,15 @@ static GstCaps *gst_nvfbc_src_get_caps(GstBaseSrc *basesrc, GstCaps *filter) {
 }
 
 static gboolean gst_nvfbc_src_set_caps(GstBaseSrc *basesrc, GstCaps *caps) {
+    GstNvfbcSrc *self = GST_NVFBC_SRC(basesrc);
+    GstStructure *s = gst_caps_get_structure(caps, 0);
+    gint fps_n = 0, fps_d = 1;
+    if (gst_structure_get_fraction(s, "framerate", &fps_n, &fps_d) && fps_n > 0) {
+        self->framerate = fps_n / fps_d;
+        self->frame_duration = gst_util_uint64_scale_int(GST_SECOND, fps_d, fps_n);
+        GST_INFO_OBJECT(self, "Caps framerate: %d/%d → frame_duration=%" G_GUINT64_FORMAT "ns",
+            fps_n, fps_d, self->frame_duration);
+    }
     return TRUE;
 }
 
@@ -441,11 +450,11 @@ static GstFlowReturn gst_nvfbc_src_create(GstPushSrc *pushsrc, GstBuffer **buf) 
     NVFBC_TOCUDA_GRAB_FRAME_PARAMS grabParams;
     memset(&grabParams, 0, sizeof(grabParams));
     grabParams.dwVersion = NVFBC_TOCUDA_GRAB_FRAME_PARAMS_VER;
-    grabParams.dwFlags = NVFBC_TOCUDA_GRAB_FLAGS_NOFLAGS;
+    grabParams.dwFlags = NVFBC_TOCUDA_GRAB_FLAGS_NOWAIT_IF_NEW_FRAME_READY;
     grabParams.pCUDADeviceBuffer = &fbc_ptr;
     grabParams.pFrameGrabInfo = &grabInfo;
-    grabParams.dwTimeoutMs = GST_TIME_AS_MSECONDS(self->frame_duration) * 2;
-    if (grabParams.dwTimeoutMs < 16) grabParams.dwTimeoutMs = 16;
+    grabParams.dwTimeoutMs = GST_TIME_AS_MSECONDS(self->frame_duration);
+    if (grabParams.dwTimeoutMs < 4) grabParams.dwTimeoutMs = 4;
 
     NVFBCSTATUS status = self->fbc_fn.nvFBCToCudaGrabFrame(self->fbc_handle, &grabParams);
     if (status != NVFBC_SUCCESS) {
