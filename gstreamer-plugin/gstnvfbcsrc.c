@@ -62,6 +62,7 @@ struct _GstNvfbcSrc {
     GstClockTime base_time;
     guint64 frame_count;
     GstClockTime frame_duration;
+    GstClockTime next_capture_time;  /* wall-clock deadline for NOWAIT pacing */
 };
 
 enum {
@@ -328,10 +329,16 @@ static gboolean gst_nvfbc_src_set_caps(GstBaseSrc *basesrc, GstCaps *caps) {
     GstStructure *s = gst_caps_get_structure(caps, 0);
     gint fps_n = 0, fps_d = 1;
     if (gst_structure_get_fraction(s, "framerate", &fps_n, &fps_d) && fps_n > 0) {
-        self->framerate = fps_n / fps_d;
-        self->frame_duration = gst_util_uint64_scale_int(GST_SECOND, fps_d, fps_n);
-        GST_INFO_OBJECT(self, "Caps framerate: %d/%d → frame_duration=%" G_GUINT64_FORMAT "ns",
-            fps_n, fps_d, self->frame_duration);
+        gint caps_fps = fps_n / fps_d;
+        /* If downstream left framerate at the template minimum (1/1), keep
+         * the explicit `framerate` property value instead. Prevents
+         * frame_duration=1s when running standalone without a capsfilter. */
+        if (caps_fps >= 2) {
+            self->framerate = caps_fps;
+            self->frame_duration = gst_util_uint64_scale_int(GST_SECOND, fps_d, fps_n);
+        }
+        GST_INFO_OBJECT(self, "Caps framerate: %d/%d → using %d fps, frame_duration=%" G_GUINT64_FORMAT "ns",
+            fps_n, fps_d, self->framerate, self->frame_duration);
     }
     return TRUE;
 }
@@ -443,6 +450,25 @@ static GstFlowReturn gst_nvfbc_src_create(GstPushSrc *pushsrc, GstBuffer **buf) 
         GST_INFO_OBJECT(self, "NvFBC + CUDA context bound to streaming thread");
     }
 
+    /* Wall-clock pacing: sleep until next_capture_time before grabbing.
+     * Ensures steady cadence at target framerate regardless of screen-update
+     * rate. Without this, NOWAIT spams duplicates at CPU speed (~4600fps). */
+    {
+        gint64 now_us = g_get_monotonic_time();
+        gint64 target_us = (gint64)(self->next_capture_time / 1000);
+        if (self->next_capture_time == 0) {
+            self->next_capture_time = (guint64)now_us * 1000;
+            target_us = now_us;
+        }
+        if (target_us > now_us) {
+            g_usleep(target_us - now_us);
+        } else if (now_us - target_us > 100000) {
+            /* Fell >100ms behind — resync to avoid burst catch-up */
+            self->next_capture_time = (guint64)now_us * 1000;
+        }
+        self->next_capture_time += self->frame_duration;
+    }
+
     /* Grab frame */
     CUdeviceptr fbc_ptr = 0;
     NVFBC_FRAME_GRAB_INFO grabInfo;
@@ -450,7 +476,12 @@ static GstFlowReturn gst_nvfbc_src_create(GstPushSrc *pushsrc, GstBuffer **buf) 
     NVFBC_TOCUDA_GRAB_FRAME_PARAMS grabParams;
     memset(&grabParams, 0, sizeof(grabParams));
     grabParams.dwVersion = NVFBC_TOCUDA_GRAB_FRAME_PARAMS_VER;
-    grabParams.dwFlags = NVFBC_TOCUDA_GRAB_FLAGS_NOWAIT_IF_NEW_FRAME_READY;
+    /* NOWAIT: returns immediately with current frame (duplicate if screen
+     * unchanged). We pace manually below so NVENC sees a steady cadence
+     * regardless of how fast the screen actually updates. This is critical
+     * for HEVC rate-control: idle 30fps wallpaper must still feed 60fps.
+     * (NOWAIT_IF_NEW_FRAME_READY blocks at screen-update rate → HEVC blur.) */
+    grabParams.dwFlags = NVFBC_TOCUDA_GRAB_FLAGS_NOWAIT;
     grabParams.pCUDADeviceBuffer = &fbc_ptr;
     grabParams.pFrameGrabInfo = &grabInfo;
     grabParams.dwTimeoutMs = GST_TIME_AS_MSECONDS(self->frame_duration);
