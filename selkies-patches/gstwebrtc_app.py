@@ -399,7 +399,7 @@ class GSTWebRTCApp:
             if "b-adapt" in nvenc_properties:
                 nvh265enc.set_property("b-adapt", False)
             nvh265enc.set_property("rc-lookahead", 0)
-            nvh265enc.set_property("vbv-buffer-size", int((self.fec_video_bitrate + self.framerate - 1) // self.framerate * self.vbv_multiplier_nv))
+            nvh265enc.set_property("vbv-buffer-size", self.fec_video_bitrate)  # 1s VBV (was ~17ms → NVENC CBR undershoot → HEVC blur)
             if Gst.version().major == 1 and 20 < Gst.version().minor <= 24:
                 if "b-frames" in nvenc_properties:
                     nvh265enc.set_property("b-frames", 0)
@@ -1237,7 +1237,7 @@ class GSTWebRTCApp:
             if self.encoder.startswith("nv"):
                 element = Gst.Bin.get_by_name(self.pipeline, "nvenc")
                 element.set_property("gop-size", -1 if self.keyframe_distance == -1.0 else self.keyframe_frame_distance)
-                element.set_property("vbv-buffer-size", int((self.fec_video_bitrate + self.framerate - 1) // self.framerate * self.vbv_multiplier_nv))
+                element.set_property("vbv-buffer-size", self.fec_video_bitrate)  # 1s VBV
             elif self.encoder.startswith("va"):
                 element = Gst.Bin.get_by_name(self.pipeline, "vaenc")
                 element.set_property("key-int-max", 1024 if self.keyframe_distance == -1.0 else self.keyframe_frame_distance)
@@ -1305,7 +1305,7 @@ class GSTWebRTCApp:
             if self.encoder.startswith("nv"):
                 element = Gst.Bin.get_by_name(self.pipeline, "nvenc")
                 if not cc:
-                    element.set_property("vbv-buffer-size", int((fec_bitrate + self.framerate - 1) // self.framerate * self.vbv_multiplier_nv))
+                    element.set_property("vbv-buffer-size", fec_bitrate)  # 1s VBV
                 element.set_property("bitrate", fec_bitrate)
             elif self.encoder.startswith("va"):
                 element = Gst.Bin.get_by_name(self.pipeline, "vaenc")
@@ -1560,6 +1560,18 @@ class GSTWebRTCApp:
             elif 'level-asymmetry-allowed=1' not in sdp_text:
                 logger.warning("injecting modified level-asymmetry-allowed to SDP")
                 sdp_text = re.sub(r'level-asymmetry-allowed=\d+', r'level-asymmetry-allowed=1', sdp_text)
+        # H.265 fmtp injection — Chromium/Brave HEVC WebRTC receiver requires
+        # explicit profile-id/tier-flag/level-id in the offer. Without it, libwebrtc
+        # either drops the track or negotiates L3.1 (max 720p60), causing the
+        # congestion controller to collapse to 144p/3fps at higher resolutions.
+        # Main profile, Main tier, Level 5 (covers 4K@60 / 1440p@144 / 1080p@240).
+        if "h265" in self.encoder or "x265" in self.encoder:
+            hevc_fmtp = 'profile-id=1;tier-flag=0;level-id=150;tx-mode=SRST;'
+            if 'profile-id=' not in sdp_text:
+                logger.warning("injecting H.265 fmtp (profile-id=1;tier-flag=0;level-id=150) to SDP")
+                sdp_text = re.sub(r'(a=rtpmap:\d+ H265/90000\r?\n)',
+                                  r'\1a=fmtp:100 ' + hevc_fmtp + '\r\n',
+                                  sdp_text)
         # Enable sps-pps-idr-in-keyframe=1 in H.264 and H.265
         if "h264" in self.encoder or "x264" in self.encoder or "h265" in self.encoder or "x265" in self.encoder:
             if 'sps-pps-idr-in-keyframe' not in sdp_text:
