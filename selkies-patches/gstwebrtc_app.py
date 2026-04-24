@@ -424,13 +424,12 @@ class GSTWebRTCApp:
             if "b-adapt" in nvenc_properties:
                 nvh265enc.set_property("b-adapt", False)
             nvh265enc.set_property("rc-lookahead", 0)
-            # VBV buffer: upstream formula `(bitrate/framerate)*mult` produces
-            # a sub-20ms buffer at 90fps/25Mbps (e.g. 397 kbits), which makes
-            # NVENC CBR undershoot target bitrate by 4× on V100 — the #1 cause
-            # of HEVC blur. Use 1× bitrate (~1 second of buffer) which is the
-            # standard for low-latency live HEVC and lets NVENC actually hit
-            # the requested bitrate while staying well under GOP length.
-            nvh265enc.set_property("vbv-buffer-size", self.fec_video_bitrate)
+            # VBV buffer: balance blur vs latency.
+            # 1-frame VBV (~17ms @90fps) → severe undershoot → blur
+            # 1-sec VBV (25000 kbits) → undershoot fixed but up to 1s of lag
+            # 100ms VBV (bitrate/10) → sweet spot: NVENC hits target bitrate
+            # without accumulating more than 100ms of pending bits.
+            nvh265enc.set_property("vbv-buffer-size", max(self.fec_video_bitrate // 10, 1000))
             if Gst.version().major == 1 and 20 < Gst.version().minor <= 24:
                 if "b-frames" in nvenc_properties:
                     nvh265enc.set_property("b-frames", 0)
@@ -444,7 +443,10 @@ class GSTWebRTCApp:
             if Gst.version().major == 1 and Gst.version().minor > 22:
                 nvh265enc.set_property("preset", "p4")
                 nvh265enc.set_property("tune", "ultra-low-latency")
-                nvh265enc.set_property("multi-pass", "two-pass-quarter")
+                # single-pass instead of two-pass-quarter: two-pass adds an
+                # entire extra encoder pass per frame (≈ one frame of latency)
+                # which is visible as smearing/lag over WebRTC
+                nvh265enc.set_property("multi-pass", "disabled")
             else:
                 nvh265enc.set_property("preset", "low-latency-hq")
 
@@ -1266,7 +1268,7 @@ class GSTWebRTCApp:
             if self.encoder.startswith("nv"):
                 element = Gst.Bin.get_by_name(self.pipeline, "nvenc")
                 element.set_property("gop-size", -1 if self.keyframe_distance == -1.0 else self.keyframe_frame_distance)
-                element.set_property("vbv-buffer-size", self.fec_video_bitrate)
+                element.set_property("vbv-buffer-size", max(self.fec_video_bitrate // 10, 1000))
             elif self.encoder.startswith("va"):
                 element = Gst.Bin.get_by_name(self.pipeline, "vaenc")
                 element.set_property("key-int-max", 1024 if self.keyframe_distance == -1.0 else self.keyframe_frame_distance)
@@ -1329,7 +1331,7 @@ class GSTWebRTCApp:
             if self.encoder.startswith("nv"):
                 element = Gst.Bin.get_by_name(self.pipeline, "nvenc")
                 if not cc:
-                    element.set_property("vbv-buffer-size", fec_bitrate)
+                    element.set_property("vbv-buffer-size", max(fec_bitrate // 10, 1000))
                 element.set_property("bitrate", fec_bitrate)
             elif self.encoder.startswith("va"):
                 element = Gst.Bin.get_by_name(self.pipeline, "vaenc")
