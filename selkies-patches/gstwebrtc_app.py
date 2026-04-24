@@ -975,10 +975,20 @@ class GSTWebRTCApp:
                 pipeline_elements += [cudaupload, cudaconvert, cudaconvert_capsfilter, nvh264enc, h264enc_capsfilter, rtph264pay, rtph264pay_capsfilter]
 
         elif self.encoder in ["nvh265enc"]:
+            # Leaky downstream queue: drop oldest encoded frames when the
+            # network (webrtcbin/TURN relay) can't keep up. Without this,
+            # backpressure propagates to the encoder which then holds frames
+            # → lag accumulates over time, especially for HEVC whose I-frames
+            # are larger than H264's. 50ms ceiling at 90fps ~= 5 frames.
+            h265_queue = Gst.ElementFactory.make("queue", "h265_leak_queue")
+            h265_queue.set_property("leaky", "downstream")
+            h265_queue.set_property("max-size-time", 50 * 1000 * 1000)  # 50 ms
+            h265_queue.set_property("max-size-buffers", 0)
+            h265_queue.set_property("max-size-bytes", 0)
             if self.using_nvfbc:
-                pipeline_elements += [cudaconvert, cudaconvert_capsfilter, nvh265enc, h265enc_capsfilter, rtph265pay, rtph265pay_capsfilter]
+                pipeline_elements += [cudaconvert, cudaconvert_capsfilter, nvh265enc, h265enc_capsfilter, h265_queue, rtph265pay, rtph265pay_capsfilter]
             else:
-                pipeline_elements += [cudaupload, cudaconvert, cudaconvert_capsfilter, nvh265enc, h265enc_capsfilter, rtph265pay, rtph265pay_capsfilter]
+                pipeline_elements += [cudaupload, cudaconvert, cudaconvert_capsfilter, nvh265enc, h265enc_capsfilter, h265_queue, rtph265pay, rtph265pay_capsfilter]
 
         elif self.encoder in ["nvav1enc"]:
             if self.using_nvfbc:
