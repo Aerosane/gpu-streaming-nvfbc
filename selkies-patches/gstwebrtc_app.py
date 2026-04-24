@@ -128,7 +128,7 @@ class GSTWebRTCApp:
 
         self.ximagesrc = None
         self.ximagesrc_caps = None
-        self._use_gpu_src = False
+        self.using_nvfbc = False
         self.last_cursor_sent = None
 
     def stop_ximagesrc(self):
@@ -141,9 +141,7 @@ class GSTWebRTCApp:
         """Helper function to start the ximagesrc, useful when resizing
         """
         if self.ximagesrc:
-            # glcapsrc doesn't have endx/endy properties
-            factory = self.ximagesrc.get_factory()
-            if factory and factory.get_name() == "ximagesrc":
+            if not self.using_nvfbc:
                 self.ximagesrc.set_property("endx", 0)
                 self.ximagesrc.set_property("endy", 0)
             self.ximagesrc.set_state(Gst.State.PLAYING)
@@ -204,36 +202,63 @@ class GSTWebRTCApp:
         """Adds the RTP video stream to the pipeline.
         """
 
-        # Try NvFBC (true zero-copy GPU capture) → glcapsrc → ximagesrc
-        self._use_gpu_src = False
-        _nvfbcsrc = Gst.ElementFactory.make("nvfbcsrc", "x11")
-        if _nvfbcsrc is not None:
-            logger.info("Using nvfbcsrc (NvFBC zero-copy VRAM pass-through, ~0% CPU)")
-            self.ximagesrc = _nvfbcsrc
-            self.ximagesrc.set_property("framerate", self.framerate)
-            self.ximagesrc.set_property("push-model", True)
-            self.ximagesrc.set_property("show-pointer", True)
-            self._use_gpu_src = True
+        # Create ximagesrc element named x11
+        # Note that when using the ximagesrc plugin, ensure that the X11 server was
+        # started with shared memory support: '+extension MIT-SHM' to achieve
+        # full frame rates.
+        # You can check if XSHM is in use with the following command:
+        #   GST_DEBUG=default:5 gst-launch-1.0 ximagesrc ! fakesink num-buffers=1 2>&1 |grep -i xshm
+        # NvFBC zero-copy GPU capture → CUDA memory output (zero CPU)
+        # Falls back to ximagesrc if nvfbcsrc plugin not available
+        _nvfbc = Gst.ElementFactory.make("nvfbcsrc", "x11")
+        if _nvfbc is not None:
+            self.ximagesrc = _nvfbc
+            self.using_nvfbc = True
+            logger.info("NvFBC: zero-copy CUDA screen capture active")
         else:
-            _glcapsrc = Gst.ElementFactory.make("glcapsrc", "x11")
-            if _glcapsrc is not None:
-                logger.info("Using glcapsrc (GL front buffer capture)")
-                self.ximagesrc = _glcapsrc
-                self.ximagesrc.set_property("framerate", self.framerate)
-                self.ximagesrc.set_property("show-pointer", 0)
-                self._use_gpu_src = True
-            else:
-                logger.info("GPU capture not available, falling back to ximagesrc")
-                self.ximagesrc = Gst.ElementFactory.make("ximagesrc", "x11")
-                ximagesrc = self.ximagesrc
-                ximagesrc.set_property("show-pointer", 0)
-                ximagesrc.set_property("remote", 1)
-                ximagesrc.set_property("blocksize", 16384)
-                ximagesrc.set_property("use-damage", 0)
+            self.ximagesrc = Gst.ElementFactory.make("ximagesrc", "x11")
+            logger.info("NvFBC unavailable, falling back to ximagesrc")
+        ximagesrc = self.ximagesrc
 
-        # GPU sources output CUDAMemory, ximagesrc outputs raw
-        if self._use_gpu_src:
-            self.ximagesrc_caps = Gst.caps_from_string("video/x-raw(memory:CUDAMemory)")
+        # disables display of the pointer using the XFixes extension,
+        # common when building a remote desktop interface as the clients
+        # mouse pointer can be used to give the user perceived lower latency.
+        # This can be programmatically toggled after the pipeline is started
+        # for example if the user is viewing fullscreen in the browser,
+        # they may want to revert to seeing the remote cursor when the
+        # client side cursor disappears.
+        if not self.using_nvfbc:
+            ximagesrc.set_property("show-pointer", 0)
+
+        # Tells GStreamer that you are using an X11 window manager or
+        # compositor with off-screen buffer. If you are not using a
+        # window manager this can be set to 0. It's also important to
+        # make sure that your X11 server is running with the XSHM extension
+        # to ensure direct memory access to frames which will reduce latency.
+        if not self.using_nvfbc:
+            ximagesrc.set_property("remote", 1)
+
+        # Defines the size in bytes to read per buffer. Increasing this from
+        # the default of 4096 bytes helps performance when capturing high
+        # resolutions like 1080P, and 2K.
+        if not self.using_nvfbc:
+            ximagesrc.set_property("blocksize", 16384)
+
+        # The X11 XDamage extension allows the X server to indicate when a
+        # regions of the screen has changed. While this can significantly
+        # reduce CPU usage when the screen is idle, it has little effect with
+        # constant motion. This can also have a negative consequences with H.264
+        # as the video stream can drop out and take several seconds to recover
+        # until a valid I-Frame is received.
+        # Set this to 0 for most streaming use cases.
+        if not self.using_nvfbc:
+            ximagesrc.set_property("use-damage", 0)
+
+        # Create capabilities for ximagesrc
+        if self.using_nvfbc:
+            # No width/height constraint — nvfbcsrc auto-negotiates on screen resize
+            self.ximagesrc_caps = Gst.caps_from_string("video/x-raw(memory:CUDAMemory),format=BGRA")
+            logger.info("NvFBC caps: CUDA BGRA (skips cudaupload)")
         else:
             self.ximagesrc_caps = Gst.caps_from_string("video/x-raw")
 
@@ -399,7 +424,13 @@ class GSTWebRTCApp:
             if "b-adapt" in nvenc_properties:
                 nvh265enc.set_property("b-adapt", False)
             nvh265enc.set_property("rc-lookahead", 0)
-            nvh265enc.set_property("vbv-buffer-size", self.fec_video_bitrate)  # 1s VBV (was ~17ms → NVENC CBR undershoot → HEVC blur)
+            # VBV buffer: upstream formula `(bitrate/framerate)*mult` produces
+            # a sub-20ms buffer at 90fps/25Mbps (e.g. 397 kbits), which makes
+            # NVENC CBR undershoot target bitrate by 4× on V100 — the #1 cause
+            # of HEVC blur. Use 1× bitrate (~1 second of buffer) which is the
+            # standard for low-latency live HEVC and lets NVENC actually hit
+            # the requested bitrate while staying well under GOP length.
+            nvh265enc.set_property("vbv-buffer-size", self.fec_video_bitrate)
             if Gst.version().major == 1 and 20 < Gst.version().minor <= 24:
                 if "b-frames" in nvenc_properties:
                     nvh265enc.set_property("b-frames", 0)
@@ -934,28 +965,21 @@ class GSTWebRTCApp:
         # Add all elements to the pipeline.
         pipeline_elements = [self.ximagesrc, self.ximagesrc_capsfilter]
 
-        # videoconvert bridge for non-CUDA encoders that need CPU color conversion
-        vc_bridge = Gst.ElementFactory.make("videoconvert")
-
         # ADD_ENCODER: add new encoder elements to this list
-        # NOTE: NVIDIA CUDA encoders skip vc_bridge — cudaupload accepts BGRx
-        # directly from ximagesrc, and cudaconvert does GPU color conversion.
-        # Removing vc_bridge reduces CPU usage from ~18% to ~5% at 1080p30.
-        # When GPU source (nvfbcsrc/glcapsrc) is used, skip cudaupload (already outputs CUDAMemory).
         if self.encoder in ["nvh264enc"]:
-            if getattr(self, '_use_gpu_src', False):
+            if self.using_nvfbc:
                 pipeline_elements += [cudaconvert, cudaconvert_capsfilter, nvh264enc, h264enc_capsfilter, rtph264pay, rtph264pay_capsfilter]
             else:
                 pipeline_elements += [cudaupload, cudaconvert, cudaconvert_capsfilter, nvh264enc, h264enc_capsfilter, rtph264pay, rtph264pay_capsfilter]
 
         elif self.encoder in ["nvh265enc"]:
-            if getattr(self, '_use_gpu_src', False):
+            if self.using_nvfbc:
                 pipeline_elements += [cudaconvert, cudaconvert_capsfilter, nvh265enc, h265enc_capsfilter, rtph265pay, rtph265pay_capsfilter]
             else:
                 pipeline_elements += [cudaupload, cudaconvert, cudaconvert_capsfilter, nvh265enc, h265enc_capsfilter, rtph265pay, rtph265pay_capsfilter]
 
         elif self.encoder in ["nvav1enc"]:
-            if getattr(self, '_use_gpu_src', False):
+            if self.using_nvfbc:
                 pipeline_elements += [cudaconvert, cudaconvert_capsfilter, nvav1enc, av1enc_capsfilter, rtpav1pay, rtpav1pay_capsfilter]
             else:
                 pipeline_elements += [cudaupload, cudaconvert, cudaconvert_capsfilter, nvav1enc, av1enc_capsfilter, rtpav1pay, rtpav1pay_capsfilter]
@@ -1030,8 +1054,8 @@ class GSTWebRTCApp:
         pulsesrc.set_property("do-timestamp", False)
 
         # Maximum and minimum amount of data to read in each iteration in microseconds
-        pulsesrc.set_property("buffer-time", 100000)
-        pulsesrc.set_property("latency-time", 1000)
+        pulsesrc.set_property("buffer-time", 200000)
+        pulsesrc.set_property("latency-time", 20000)
 
         # Create capabilities for pulsesrc and set channels
         pulsesrc_caps = Gst.caps_from_string("audio/x-raw")
@@ -1051,7 +1075,7 @@ class GSTWebRTCApp:
         opusenc.set_property("bitrate-type", "cbr")
         # OPUS_FRAME: Modify all locations with "OPUS_FRAME:"
         # Browser-side SDP munging ("minptime=3"/"minptime=5") is required if frame-size < 10
-        opusenc.set_property("frame-size", "10")
+        opusenc.set_property("frame-size", "20")
         opusenc.set_property("perfect-timestamp", True)
         opusenc.set_property("max-payload-size", 4000)
         # In-band FEC in Opus
@@ -1231,13 +1255,18 @@ class GSTWebRTCApp:
             framerate {integer} -- framerate in frames per second, for example, 15, 30, 60.
         """
         if self.pipeline:
+            # Cap at 90 fps — 144 fps over WebRTC/TURN saturates jitter buffer
+            # and makes HEVC stream choppy (encoder has headroom, network doesn't)
+            if framerate > 90:
+                logger.info("clamping requested framerate %d to 90" % framerate)
+                framerate = 90
             self.framerate = framerate
             # ADD_ENCODER: GOP/IDR Keyframe distance to keep the stream from freezing (in keyframe_dist seconds) and set vbv-buffer-size
             self.keyframe_frame_distance = -1 if self.keyframe_distance == -1.0 else max(self.min_keyframe_frame_distance, int(self.framerate * self.keyframe_distance))
             if self.encoder.startswith("nv"):
                 element = Gst.Bin.get_by_name(self.pipeline, "nvenc")
                 element.set_property("gop-size", -1 if self.keyframe_distance == -1.0 else self.keyframe_frame_distance)
-                element.set_property("vbv-buffer-size", self.fec_video_bitrate)  # 1s VBV
+                element.set_property("vbv-buffer-size", self.fec_video_bitrate)
             elif self.encoder.startswith("va"):
                 element = Gst.Bin.get_by_name(self.pipeline, "vaenc")
                 element.set_property("key-int-max", 1024 if self.keyframe_distance == -1.0 else self.keyframe_frame_distance)
@@ -1271,13 +1300,8 @@ class GSTWebRTCApp:
             else:
                 logger.warning("setting keyframe interval (GOP size) not supported with encoder: %s" % self.encoder)
 
-            if getattr(self, '_use_gpu_src', False):
-                self.ximagesrc_caps = Gst.caps_from_string("video/x-raw(memory:CUDAMemory)")
-                # Update GPU source element's framerate property so get_caps matches
-                try:
-                    self.ximagesrc.set_property("framerate", framerate)
-                except Exception:
-                    pass
+            if self.using_nvfbc:
+                self.ximagesrc_caps = Gst.caps_from_string("video/x-raw(memory:CUDAMemory),format=BGRA")
             else:
                 self.ximagesrc_caps = Gst.caps_from_string("video/x-raw")
             self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))
@@ -1305,7 +1329,7 @@ class GSTWebRTCApp:
             if self.encoder.startswith("nv"):
                 element = Gst.Bin.get_by_name(self.pipeline, "nvenc")
                 if not cc:
-                    element.set_property("vbv-buffer-size", fec_bitrate)  # 1s VBV
+                    element.set_property("vbv-buffer-size", fec_bitrate)
                 element.set_property("bitrate", fec_bitrate)
             elif self.encoder.startswith("va"):
                 element = Gst.Bin.get_by_name(self.pipeline, "vaenc")
@@ -1382,10 +1406,7 @@ class GSTWebRTCApp:
         """
 
         element = Gst.Bin.get_by_name(self.pipeline, "x11")
-        # nvfbcsrc with push-model requires cursor OFF (direct capture).
-        # Selkies renders cursor client-side via enable_cursors.
-        if not getattr(self, '_use_gpu_src', False):
-            element.set_property("show-pointer", visible)
+        element.set_property("show-pointer", visible)
         self.__send_data_channel_message(
             "pipeline", {"status": "Set pointer visibility to: %d" % visible})
 
@@ -1560,18 +1581,6 @@ class GSTWebRTCApp:
             elif 'level-asymmetry-allowed=1' not in sdp_text:
                 logger.warning("injecting modified level-asymmetry-allowed to SDP")
                 sdp_text = re.sub(r'level-asymmetry-allowed=\d+', r'level-asymmetry-allowed=1', sdp_text)
-        # H.265 fmtp injection — Chromium/Brave HEVC WebRTC receiver requires
-        # explicit profile-id/tier-flag/level-id in the offer. Without it, libwebrtc
-        # either drops the track or negotiates L3.1 (max 720p60), causing the
-        # congestion controller to collapse to 144p/3fps at higher resolutions.
-        # Main profile, Main tier, Level 5 (covers 4K@60 / 1440p@144 / 1080p@240).
-        if "h265" in self.encoder or "x265" in self.encoder:
-            hevc_fmtp = 'profile-id=1;tier-flag=0;level-id=150;tx-mode=SRST;'
-            if 'profile-id=' not in sdp_text:
-                logger.warning("injecting H.265 fmtp (profile-id=1;tier-flag=0;level-id=150) to SDP")
-                sdp_text = re.sub(r'(a=rtpmap:\d+ H265/90000\r?\n)',
-                                  r'\1a=fmtp:100 ' + hevc_fmtp + '\r\n',
-                                  sdp_text)
         # Enable sps-pps-idr-in-keyframe=1 in H.264 and H.265
         if "h264" in self.encoder or "x264" in self.encoder or "h265" in self.encoder or "x265" in self.encoder:
             if 'sps-pps-idr-in-keyframe' not in sdp_text:
@@ -1738,9 +1747,9 @@ class GSTWebRTCApp:
             options.set_value("max-retransmits", 0)
             self.data_channel = self.webrtcbin.emit(
                 'create-data-channel', "input", options)
-            self.data_channel.connect('on-open', lambda _: self.on_data_open())
-            self.data_channel.connect('on-close', lambda _: self.on_data_close())
-            self.data_channel.connect('on-error', lambda _, err: self.on_data_error())
+            self.data_channel.connect('on-open', lambda *_: self.on_data_open())
+            self.data_channel.connect('on-close', lambda *_: self.on_data_close())
+            self.data_channel.connect('on-error', lambda *_: self.on_data_error())
             self.data_channel.connect(
                 'on-message-string', lambda _, msg: self.on_data_message(msg))
 
