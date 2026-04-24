@@ -424,12 +424,7 @@ class GSTWebRTCApp:
             if "b-adapt" in nvenc_properties:
                 nvh265enc.set_property("b-adapt", False)
             nvh265enc.set_property("rc-lookahead", 0)
-            # VBV buffer: balance blur vs latency.
-            # 1-frame VBV (~17ms @90fps) → severe undershoot → blur
-            # 1-sec VBV (25000 kbits) → undershoot fixed but up to 1s of lag
-            # 100ms VBV (bitrate/10) → sweet spot: NVENC hits target bitrate
-            # without accumulating more than 100ms of pending bits.
-            nvh265enc.set_property("vbv-buffer-size", max(self.fec_video_bitrate // 10, 1000))
+            nvh265enc.set_property("vbv-buffer-size", int((self.fec_video_bitrate + self.framerate - 1) // self.framerate * self.vbv_multiplier_nv))
             if Gst.version().major == 1 and 20 < Gst.version().minor <= 24:
                 if "b-frames" in nvenc_properties:
                     nvh265enc.set_property("b-frames", 0)
@@ -443,10 +438,7 @@ class GSTWebRTCApp:
             if Gst.version().major == 1 and Gst.version().minor > 22:
                 nvh265enc.set_property("preset", "p4")
                 nvh265enc.set_property("tune", "ultra-low-latency")
-                # single-pass instead of two-pass-quarter: two-pass adds an
-                # entire extra encoder pass per frame (≈ one frame of latency)
-                # which is visible as smearing/lag over WebRTC
-                nvh265enc.set_property("multi-pass", "disabled")
+                nvh265enc.set_property("multi-pass", "two-pass-quarter")
             else:
                 nvh265enc.set_property("preset", "low-latency-hq")
 
@@ -975,20 +967,10 @@ class GSTWebRTCApp:
                 pipeline_elements += [cudaupload, cudaconvert, cudaconvert_capsfilter, nvh264enc, h264enc_capsfilter, rtph264pay, rtph264pay_capsfilter]
 
         elif self.encoder in ["nvh265enc"]:
-            # Leaky downstream queue: drop oldest encoded frames when the
-            # network (webrtcbin/TURN relay) can't keep up. Without this,
-            # backpressure propagates to the encoder which then holds frames
-            # → lag accumulates over time, especially for HEVC whose I-frames
-            # are larger than H264's. 50ms ceiling at 90fps ~= 5 frames.
-            h265_queue = Gst.ElementFactory.make("queue", "h265_leak_queue")
-            h265_queue.set_property("leaky", "downstream")
-            h265_queue.set_property("max-size-time", 50 * 1000 * 1000)  # 50 ms
-            h265_queue.set_property("max-size-buffers", 0)
-            h265_queue.set_property("max-size-bytes", 0)
             if self.using_nvfbc:
-                pipeline_elements += [cudaconvert, cudaconvert_capsfilter, nvh265enc, h265enc_capsfilter, h265_queue, rtph265pay, rtph265pay_capsfilter]
+                pipeline_elements += [cudaconvert, cudaconvert_capsfilter, nvh265enc, h265enc_capsfilter, rtph265pay, rtph265pay_capsfilter]
             else:
-                pipeline_elements += [cudaupload, cudaconvert, cudaconvert_capsfilter, nvh265enc, h265enc_capsfilter, h265_queue, rtph265pay, rtph265pay_capsfilter]
+                pipeline_elements += [cudaupload, cudaconvert, cudaconvert_capsfilter, nvh265enc, h265enc_capsfilter, rtph265pay, rtph265pay_capsfilter]
 
         elif self.encoder in ["nvav1enc"]:
             if self.using_nvfbc:
@@ -1267,18 +1249,13 @@ class GSTWebRTCApp:
             framerate {integer} -- framerate in frames per second, for example, 15, 30, 60.
         """
         if self.pipeline:
-            # Cap at 90 fps — 144 fps over WebRTC/TURN saturates jitter buffer
-            # and makes HEVC stream choppy (encoder has headroom, network doesn't)
-            if framerate > 90:
-                logger.info("clamping requested framerate %d to 90" % framerate)
-                framerate = 90
             self.framerate = framerate
             # ADD_ENCODER: GOP/IDR Keyframe distance to keep the stream from freezing (in keyframe_dist seconds) and set vbv-buffer-size
             self.keyframe_frame_distance = -1 if self.keyframe_distance == -1.0 else max(self.min_keyframe_frame_distance, int(self.framerate * self.keyframe_distance))
             if self.encoder.startswith("nv"):
                 element = Gst.Bin.get_by_name(self.pipeline, "nvenc")
                 element.set_property("gop-size", -1 if self.keyframe_distance == -1.0 else self.keyframe_frame_distance)
-                element.set_property("vbv-buffer-size", max(self.fec_video_bitrate // 10, 1000))
+                element.set_property("vbv-buffer-size", int((self.fec_video_bitrate + self.framerate - 1) // self.framerate * self.vbv_multiplier_nv))
             elif self.encoder.startswith("va"):
                 element = Gst.Bin.get_by_name(self.pipeline, "vaenc")
                 element.set_property("key-int-max", 1024 if self.keyframe_distance == -1.0 else self.keyframe_frame_distance)
@@ -1341,7 +1318,7 @@ class GSTWebRTCApp:
             if self.encoder.startswith("nv"):
                 element = Gst.Bin.get_by_name(self.pipeline, "nvenc")
                 if not cc:
-                    element.set_property("vbv-buffer-size", max(fec_bitrate // 10, 1000))
+                    element.set_property("vbv-buffer-size", int((fec_bitrate + self.framerate - 1) // self.framerate * self.vbv_multiplier_nv))
                 element.set_property("bitrate", fec_bitrate)
             elif self.encoder.startswith("va"):
                 element = Gst.Bin.get_by_name(self.pipeline, "vaenc")

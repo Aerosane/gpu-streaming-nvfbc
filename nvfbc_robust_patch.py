@@ -106,23 +106,9 @@ def patch_gstwebrtc_app(path):
     assert old_fr in src, "PATCH7: set_framerate caps not found"
     src = src.replace(old_fr, new_fr, 1)
 
-    # ---------- 8. Cap framerate at 90 fps — 144 saturates WebRTC jitter buffer ----------
-    old_cap = ('        if self.pipeline:\n'
-               '            self.framerate = framerate\n'
-               '            # ADD_ENCODER: GOP/IDR Keyframe distance to keep the stream from freezing')
-    new_cap = ('        if self.pipeline:\n'
-               '            if framerate > 90:\n'
-               '                logger.info("clamping requested framerate %d to 90" % framerate)\n'
-               '                framerate = 90\n'
-               '            self.framerate = framerate\n'
-               '            # ADD_ENCODER: GOP/IDR Keyframe distance to keep the stream from freezing')
-    if old_cap in src:
-        src = src.replace(old_cap, new_cap, 1)
-        print("  ✓ gstwebrtc_app.py: framerate clamp (90 fps) applied")
-
     with open(path, 'w') as f:
         f.write(src)
-    print(f"  ✓ gstwebrtc_app.py: 8 patches applied")
+    print(f"  ✓ gstwebrtc_app.py: 7 patches applied")
 
 
 def patch_resize(path):
