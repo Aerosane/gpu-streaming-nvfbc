@@ -1503,7 +1503,11 @@ class GSTWebRTCApp:
             visible {bool} -- True to enable pointer visibility
         """
 
-        element = Gst.Bin.get_by_name(self.pipeline, "x11")
+        element = Gst.Bin.get_by_name(self.pipeline, "nvfbcenc")
+        if element is None:
+            element = Gst.Bin.get_by_name(self.pipeline, "x11")
+        if element is None:
+            return
         element.set_property("show-pointer", visible)
         self.__send_data_channel_message(
             "pipeline", {"status": "Set pointer visibility to: %d" % visible})
