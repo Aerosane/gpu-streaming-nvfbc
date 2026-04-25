@@ -513,6 +513,24 @@ static gboolean gst_nvfbc_enc_stop(GstBaseSrc *base) {
     }
     self->context_bound = FALSE;
 
+    /* Destroy FBC handle so _start() can re-create cleanly (resize cycle) */
+    if (self->fbc_handle && self->fbc_fn.nvFBCDestroyHandle) {
+        NVFBC_DESTROY_HANDLE_PARAMS dhParams;
+        memset(&dhParams, 0, sizeof(dhParams));
+        dhParams.dwVersion = NVFBC_DESTROY_HANDLE_PARAMS_VER;
+        self->fbc_fn.nvFBCDestroyHandle(self->fbc_handle, &dhParams);
+        self->fbc_handle = 0;
+    }
+
+    /* Destroy CUDA context so _start() creates a fresh one */
+    if (self->cu_ctx) {
+        cuCtxDestroy(self->cu_ctx);
+        self->cu_ctx = NULL;
+    }
+
+    /* Reset NVENC registered resource state */
+    self->registered_res = NULL;
+
     return TRUE;
 }
 
