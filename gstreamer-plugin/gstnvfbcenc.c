@@ -277,7 +277,7 @@ static gboolean create_nvenc_session(GstNvfbcEnc *self) {
     encConfig.rcParams.vbvInitialDelay = vbv;
     encConfig.rcParams.zeroReorderDelay = 1;
     encConfig.rcParams.enableAQ = 1;
-    encConfig.rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+    encConfig.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
 
     /* H264-specific: Main profile, no B-frames, CABAC, repeat SPS/PPS */
     encConfig.profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
