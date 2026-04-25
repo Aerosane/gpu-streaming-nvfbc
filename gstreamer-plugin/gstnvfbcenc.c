@@ -238,7 +238,7 @@ static gboolean create_nvenc_session(GstNvfbcEnc *self) {
     memset(&initParams, 0, sizeof(initParams));
     initParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
     initParams.encodeGUID = NV_ENC_CODEC_H264_GUID;
-    initParams.presetGUID = NV_ENC_PRESET_P4_GUID;
+    initParams.presetGUID = NV_ENC_PRESET_P7_GUID;
     initParams.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
     initParams.encodeWidth = self->width;
     initParams.encodeHeight = self->height;
@@ -256,7 +256,7 @@ static gboolean create_nvenc_session(GstNvfbcEnc *self) {
     presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
 
     nst = self->nvenc_fn.nvEncGetEncodePresetConfigEx(self->nvenc_session,
-        NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P4_GUID,
+        NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P7_GUID,
         NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &presetConfig);
     if (nst != NV_ENC_SUCCESS) {
         GST_ERROR_OBJECT(self, "nvEncGetEncodePresetConfigEx failed: %d", nst);
@@ -276,8 +276,8 @@ static gboolean create_nvenc_session(GstNvfbcEnc *self) {
     encConfig.rcParams.vbvBufferSize = vbv;
     encConfig.rcParams.vbvInitialDelay = vbv;
     encConfig.rcParams.zeroReorderDelay = 1;
-    encConfig.rcParams.enableAQ = 0;
-    encConfig.rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+    encConfig.rcParams.enableAQ = 1;
+    encConfig.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
 
     /* H264-specific: Main profile, no B-frames, CABAC, repeat SPS/PPS */
     encConfig.profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
