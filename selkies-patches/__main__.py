@@ -203,11 +203,16 @@ def parse_rtc_config(data):
                 turn_port = url.split(':')[2].split('?')[0]
                 turn_user = ice_server['username']
                 turn_password = ice_server['credential']
-                turn_uri = "turn://%s:%s@%s:%s" % (
+                # Preserve ?transport= query parameter for UDP/TCP selection
+                transport_param = ""
+                if '?' in url:
+                    transport_param = "?" + url.split('?', 1)[1]
+                turn_uri = "turn://%s:%s@%s:%s%s" % (
                     urllib.parse.quote(turn_user, safe=""),
                     urllib.parse.quote(turn_password, safe=""),
                     turn_host,
-                    turn_port
+                    turn_port,
+                    transport_param
                 )
                 turn_uris.append(turn_uri)
             elif url.startswith("turns:"):
@@ -215,11 +220,15 @@ def parse_rtc_config(data):
                 turn_port = url.split(':')[2].split('?')[0]
                 turn_user = ice_server['username']
                 turn_password = ice_server['credential']
-                turn_uri = "turns://%s:%s@%s:%s" % (
+                transport_param = ""
+                if '?' in url:
+                    transport_param = "?" + url.split('?', 1)[1]
+                turn_uri = "turns://%s:%s@%s:%s%s" % (
                     urllib.parse.quote(turn_user, safe=""),
                     urllib.parse.quote(turn_password, safe=""),
                     turn_host,
-                    turn_port
+                    turn_port,
+                    transport_param
                 )
                 turn_uris.append(turn_uri)
     return stun_uris, turn_uris, data
@@ -537,7 +546,7 @@ def main():
     async def on_signalling_error(e):
        if isinstance(e, WebRTCSignallingErrorNoPeer):
            # Waiting for peer to connect, retry in 2 seconds.
-           time.sleep(2)
+           await asyncio.sleep(2)
            await signalling.setup_call()
        else:
            logger.error("signalling error: %s", str(e))
@@ -545,7 +554,7 @@ def main():
     async def on_audio_signalling_error(e):
        if isinstance(e, WebRTCSignallingErrorNoPeer):
            # Waiting for peer to connect, retry in 2 seconds.
-           time.sleep(2)
+           await asyncio.sleep(2)
            await audio_signalling.setup_call()
        else:
            logger.error("signalling error: %s", str(e))
@@ -640,23 +649,27 @@ def main():
     # Start the pipeline once the session is established.
     def on_session_handler(session_peer_id, meta=None):
         logger.info("starting session for peer id {} with meta: {}".format(session_peer_id, meta))
-        if str(session_peer_id) == str(peer_id):
-            if meta:
-                if enable_resize:
-                    if meta["res"]:
-                        on_resize_handler(meta["res"])
-                    if meta["scale"]:
-                        on_scaling_ratio_handler(meta["scale"])
-                else:
-                    logger.info("setting cursor to default size")
-                    set_cursor_size(16)
-            logger.info("starting video pipeline")
-            app.start_pipeline()
-        elif str(session_peer_id) == str(audio_peer_id):
-            logger.info("starting audio pipeline")
-            audio_app.start_pipeline(audio_only=True)
-        else:
-            logger.error("failed to start pipeline for peer_id: %s" % peer_id)
+        try:
+            if str(session_peer_id) == str(peer_id):
+                if meta:
+                    if enable_resize:
+                        if meta["res"]:
+                            on_resize_handler(meta["res"])
+                        if meta["scale"]:
+                            on_scaling_ratio_handler(meta["scale"])
+                    else:
+                        logger.info("setting cursor to default size")
+                        set_cursor_size(16)
+                logger.info("starting video pipeline")
+                app.start_pipeline()
+            elif str(session_peer_id) == str(audio_peer_id):
+                logger.info("starting audio pipeline")
+                audio_app.start_pipeline(audio_only=True)
+            else:
+                logger.error("failed to start pipeline for peer_id: %s" % peer_id)
+        except Exception as e:
+            logger.error("session handler error (non-fatal): %s" % e)
+            traceback.print_exc()
 
     signalling.on_session = on_session_handler
     audio_signalling.on_session = on_session_handler
@@ -721,12 +734,24 @@ def main():
                 logger.warning("skipping resize because last resize failed.")
                 return
             logger.warning("resizing display from {} to {}".format(curr_res, new_res))
-            # Stop video source before xrandr (nvfbcsrc needs stop/start for new resolution)
-            app.stop_ximagesrc()
-            if resize_display(res):
-                app.send_remote_resolution(res)
-            # Restart video source (nvfbcsrc will re-query screen size on start)
-            app.start_ximagesrc()
+            try:
+                # Stop capture before xrandr mode switch
+                app.stop_ximagesrc()
+                if resize_display(res):
+                    app.send_remote_resolution(res)
+                # Let X server settle after xrandr mode switch
+                import time
+                time.sleep(0.2)
+                # Restart capture at new resolution
+                app.start_ximagesrc()
+            except Exception as e:
+                logger.error("resize failed: {}".format(e))
+                app.last_resize_success = False
+                # Try to recover by restarting capture anyway
+                try:
+                    app.start_ximagesrc()
+                except Exception:
+                    pass
 
     # Initial binding of enable resize handler.
     if enable_resize:

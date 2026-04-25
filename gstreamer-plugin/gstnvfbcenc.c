@@ -530,6 +530,8 @@ static gboolean gst_nvfbc_enc_stop(GstBaseSrc *base) {
 
     /* Reset NVENC registered resource state */
     self->registered_res = NULL;
+    self->mapped_input = NULL;
+    self->last_fbc_ptr = 0;
 
     return TRUE;
 }
@@ -581,9 +583,16 @@ static GstFlowReturn gst_nvfbc_enc_create(GstPushSrc *pushsrc, GstBuffer **buf) 
 
     NVFBCSTATUS fbc_st = self->fbc_fn.nvFBCToCudaGrabFrame(self->fbc_handle, &grabParams);
     if (fbc_st != NVFBC_SUCCESS) {
-        GST_ERROR_OBJECT(self, "NvFBCToCudaGrabFrame failed: %d — %s",
+        GST_WARNING_OBJECT(self, "NvFBCToCudaGrabFrame failed: %d — %s (retrying)",
             fbc_st, self->fbc_fn.nvFBCGetLastErrorStr(self->fbc_handle));
-        return GST_FLOW_ERROR;
+        /* Transient failure (e.g. during xrandr mode switch) — sleep and retry once */
+        g_usleep(50000); /* 50ms */
+        fbc_st = self->fbc_fn.nvFBCToCudaGrabFrame(self->fbc_handle, &grabParams);
+        if (fbc_st != NVFBC_SUCCESS) {
+            GST_ERROR_OBJECT(self, "NvFBCToCudaGrabFrame retry failed: %d — %s",
+                fbc_st, self->fbc_fn.nvFBCGetLastErrorStr(self->fbc_handle));
+            return GST_FLOW_ERROR;
+        }
     }
 
     /* Handle resolution change */
