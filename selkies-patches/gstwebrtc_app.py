@@ -991,25 +991,89 @@ class GSTWebRTCApp:
             pipeline_elements += [vapostproc, vapostproc_capsfilter, vaav1enc, av1enc_capsfilter, rtpav1pay, rtpav1pay_capsfilter]
 
         elif self.encoder in ["x264enc"]:
-            pipeline_elements += [videoconvert, videoconvert_capsfilter, x264enc, h264enc_capsfilter, rtph264pay, rtph264pay_capsfilter]
+            if self.using_nvfbc:
+                # NvFBC: CUDA BGRA → cudaconvert (GPU NV12) → cudadownload → x264enc
+                _cc = Gst.ElementFactory.make("cudaconvert")
+                _cc_caps = Gst.caps_from_string("video/x-raw(memory:CUDAMemory)")
+                _cc_caps.set_value("format", "NV12")
+                _cc_cf = Gst.ElementFactory.make("capsfilter")
+                _cc_cf.set_property("caps", _cc_caps)
+                _dl = Gst.ElementFactory.make("cudadownload")
+                pipeline_elements += [_cc, _cc_cf, _dl, x264enc, h264enc_capsfilter, rtph264pay, rtph264pay_capsfilter]
+            else:
+                pipeline_elements += [videoconvert, videoconvert_capsfilter, x264enc, h264enc_capsfilter, rtph264pay, rtph264pay_capsfilter]
 
         elif self.encoder in ["openh264enc"]:
-            pipeline_elements += [videoconvert, videoconvert_capsfilter, openh264enc, h264enc_capsfilter, rtph264pay, rtph264pay_capsfilter]
+            if self.using_nvfbc:
+                _cc = Gst.ElementFactory.make("cudaconvert")
+                _cc_caps = Gst.caps_from_string("video/x-raw(memory:CUDAMemory)")
+                _cc_caps.set_value("format", "NV12")
+                _cc_cf = Gst.ElementFactory.make("capsfilter")
+                _cc_cf.set_property("caps", _cc_caps)
+                _dl = Gst.ElementFactory.make("cudadownload")
+                pipeline_elements += [_cc, _cc_cf, _dl, openh264enc, h264enc_capsfilter, rtph264pay, rtph264pay_capsfilter]
+            else:
+                pipeline_elements += [videoconvert, videoconvert_capsfilter, openh264enc, h264enc_capsfilter, rtph264pay, rtph264pay_capsfilter]
 
         elif self.encoder in ["x265enc"]:
-            pipeline_elements += [videoconvert, videoconvert_capsfilter, x265enc, h265enc_capsfilter, rtph265pay, rtph265pay_capsfilter]
+            if self.using_nvfbc:
+                _cc = Gst.ElementFactory.make("cudaconvert")
+                _cc_caps = Gst.caps_from_string("video/x-raw(memory:CUDAMemory)")
+                _cc_caps.set_value("format", "NV12")
+                _cc_cf = Gst.ElementFactory.make("capsfilter")
+                _cc_cf.set_property("caps", _cc_caps)
+                _dl = Gst.ElementFactory.make("cudadownload")
+                pipeline_elements += [_cc, _cc_cf, _dl, x265enc, h265enc_capsfilter, rtph265pay, rtph265pay_capsfilter]
+            else:
+                pipeline_elements += [videoconvert, videoconvert_capsfilter, x265enc, h265enc_capsfilter, rtph265pay, rtph265pay_capsfilter]
 
         elif self.encoder in ["vp8enc", "vp9enc"]:
-            pipeline_elements += [videoconvert, videoconvert_capsfilter, vpenc, vpenc_capsfilter, rtpvppay, rtpvppay_capsfilter]
+            if self.using_nvfbc:
+                _cc = Gst.ElementFactory.make("cudaconvert")
+                _cc_caps = Gst.caps_from_string("video/x-raw(memory:CUDAMemory)")
+                _cc_caps.set_value("format", "NV12")
+                _cc_cf = Gst.ElementFactory.make("capsfilter")
+                _cc_cf.set_property("caps", _cc_caps)
+                _dl = Gst.ElementFactory.make("cudadownload")
+                pipeline_elements += [_cc, _cc_cf, _dl, vpenc, vpenc_capsfilter, rtpvppay, rtpvppay_capsfilter]
+            else:
+                pipeline_elements += [videoconvert, videoconvert_capsfilter, vpenc, vpenc_capsfilter, rtpvppay, rtpvppay_capsfilter]
 
         elif self.encoder in ["svtav1enc"]:
-            pipeline_elements += [videoconvert, videoconvert_capsfilter, svtav1enc, av1enc_capsfilter, rtpav1pay, rtpav1pay_capsfilter]
+            if self.using_nvfbc:
+                _cc = Gst.ElementFactory.make("cudaconvert")
+                _cc_caps = Gst.caps_from_string("video/x-raw(memory:CUDAMemory)")
+                _cc_caps.set_value("format", "NV12")
+                _cc_cf = Gst.ElementFactory.make("capsfilter")
+                _cc_cf.set_property("caps", _cc_caps)
+                _dl = Gst.ElementFactory.make("cudadownload")
+                pipeline_elements += [_cc, _cc_cf, _dl, svtav1enc, av1enc_capsfilter, rtpav1pay, rtpav1pay_capsfilter]
+            else:
+                pipeline_elements += [videoconvert, videoconvert_capsfilter, svtav1enc, av1enc_capsfilter, rtpav1pay, rtpav1pay_capsfilter]
 
         elif self.encoder in ["av1enc"]:
-            pipeline_elements += [videoconvert, videoconvert_capsfilter, av1enc, av1enc_capsfilter, rtpav1pay, rtpav1pay_capsfilter]
+            if self.using_nvfbc:
+                _cc = Gst.ElementFactory.make("cudaconvert")
+                _cc_caps = Gst.caps_from_string("video/x-raw(memory:CUDAMemory)")
+                _cc_caps.set_value("format", "NV12")
+                _cc_cf = Gst.ElementFactory.make("capsfilter")
+                _cc_cf.set_property("caps", _cc_caps)
+                _dl = Gst.ElementFactory.make("cudadownload")
+                pipeline_elements += [_cc, _cc_cf, _dl, av1enc, av1enc_capsfilter, rtpav1pay, rtpav1pay_capsfilter]
+            else:
+                pipeline_elements += [videoconvert, videoconvert_capsfilter, av1enc, av1enc_capsfilter, rtpav1pay, rtpav1pay_capsfilter]
 
         elif self.encoder in ["rav1enc"]:
-            pipeline_elements += [videoconvert, videoconvert_capsfilter, rav1enc, av1enc_capsfilter, rtpav1pay, rtpav1pay_capsfilter]
+            if self.using_nvfbc:
+                _cc = Gst.ElementFactory.make("cudaconvert")
+                _cc_caps = Gst.caps_from_string("video/x-raw(memory:CUDAMemory)")
+                _cc_caps.set_value("format", "NV12")
+                _cc_cf = Gst.ElementFactory.make("capsfilter")
+                _cc_cf.set_property("caps", _cc_caps)
+                _dl = Gst.ElementFactory.make("cudadownload")
+                pipeline_elements += [_cc, _cc_cf, _dl, rav1enc, av1enc_capsfilter, rtpav1pay, rtpav1pay_capsfilter]
+            else:
+                pipeline_elements += [videoconvert, videoconvert_capsfilter, rav1enc, av1enc_capsfilter, rtpav1pay, rtpav1pay_capsfilter]
 
         for pipeline_element in pipeline_elements:
             self.pipeline.add(pipeline_element)
