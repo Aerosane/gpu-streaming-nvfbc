@@ -744,12 +744,12 @@ static void gst_nvfbc_enc_finalize(GObject *obj) {
 /* ======================== GObject boilerplate ======================== */
 
 static void gst_nvfbc_enc_init(GstNvfbcEnc *self) {
-    self->framerate = 90;
+    self->framerate = 144;
     self->bitrate = 25000;
     self->vbv_buffer = 0;   /* auto = 2× bitrate */
     self->show_pointer = TRUE;
     self->push_model = TRUE;
-    self->frame_duration = gst_util_uint64_scale_int(GST_SECOND, 1, 90);
+    self->frame_duration = gst_util_uint64_scale_int(GST_SECOND, 1, 144);
     self->base_time = GST_CLOCK_TIME_NONE;
     self->next_capture_time = 0;
     self->fbc_handle = 0;
@@ -820,7 +820,7 @@ static void gst_nvfbc_enc_class_init(GstNvfbcEncClass *klass) {
 
     g_object_class_install_property(gobject_class, PROP_FRAMERATE,
         g_param_spec_int("framerate", "Framerate", "Target capture framerate",
-                         1, 240, 90, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+                         1, 240, 144, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
     g_object_class_install_property(gobject_class, PROP_BITRATE,
         g_param_spec_int("bitrate", "Bitrate", "Target bitrate in kbit/s",
                          100, 200000, 25000, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
