@@ -198,16 +198,16 @@ Xft.lcdfilter: lcddefault
 Xft.dpi: 96"
 ok "Xrdb font rendering applied"
 
-# Add 144Hz modelines for common resolutions (Selkies resize will use these)
+# Add 90Hz modelines for common resolutions (Selkies resize will use these)
 for MODE_SPEC in \
-    "1920x876_144 259.20 1920 1928 1960 2000 876 879 884 900 +hsync -vsync" \
-    "1920x1080_144 325.08 1920 1928 1960 2000 1080 1083 1088 1130 +hsync -vsync" \
-    "2560x1440_144 587.59 2560 2568 2600 2640 1440 1443 1448 1553 +hsync -vsync"; do
+    "1920x876_90 217.00 1920 2064 2264 2608 876 879 889 925 -hsync +vsync" \
+    "1920x1080_90 269.00 1920 2064 2272 2624 1080 1083 1088 1140 -hsync +vsync" \
+    "2560x1440_90 483.00 2560 2768 3048 3536 1440 1443 1448 1519 -hsync +vsync"; do
     xrandr --newmode $MODE_SPEC 2>/dev/null || true
     MODE_NAME="${MODE_SPEC%% *}"
     xrandr --addmode DVI-D-0 "$MODE_NAME" 2>/dev/null || true
 done
-ok "144Hz modelines added (876p/1080p/1440p)"
+ok "90Hz modelines added (876p/1080p/1440p)"
 
 #───────────────────────────────────────────────────────────────
 # 3. PulseAudio + Selkies Audio Sink (BEFORE Plasma so it gets PULSE_SERVER)
@@ -595,7 +595,7 @@ json.dump(rtc, open('$RTC_JSON', 'w'))
             --addr=0.0.0.0 --port="$SELKIES_PORT" \
             --web_root=/opt/selkies-web/gst-web \
             --enable_resize=true --framerate=144 --video_bitrate=8000 \
-            --encoder=nvh264enc \
+            --encoder=nvh265enc \
             --enable_basic_auth=false \
             --rtc_config_json="$RTC_JSON" \
             $TURN_ARGS \

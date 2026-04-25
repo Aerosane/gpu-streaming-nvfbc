@@ -62,10 +62,10 @@ echo "WAYLAND=$WAYLAND_DISPLAY"
 # Start Selkies-GStreamer
 export GI_TYPELIB_PATH=/usr/lib/x86_64-linux-gnu/girepository-1.0
 export SELKIES_ENCODER=nvh265enc
-export SELKIES_FRAMERATE=144
+export SELKIES_FRAMERATE=90
 
 python3 -m selkies \
-  --framerate 144 \
+  --framerate 90 \
   --encoder nvh265enc \
   --port 8888 \
   --wayland-socket-index 0 \

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Robust NvFBC + 144Hz patch for selkies-gstreamer.
+Robust NvFBC + 90Hz patch for selkies-gstreamer.
 
 Fixes:
   1. gstwebrtc_app.py: Use nvfbcsrc (GPU zero-copy capture) instead of ximagesrc (CPU)
@@ -10,11 +10,11 @@ Fixes:
      - Guards ximagesrc-only properties (show-pointer, remote, blocksize, use-damage, endx, endy)
      - Preserves CUDA memory caps in set_framerate() runtime updates
 
-  2. resize.py: Always create+select 144Hz modes on resize
-     - Discovers existing _144 modes from xrandr (regex includes suffixed names)
-     - Prefers existing 144Hz mode; generates new 144Hz via cvt if needed
-     - Falls back to 60Hz if cvt can't produce 144Hz modeline
-     - curr_res detection strips _144 suffix for comparison with browser-requested WxH
+  2. resize.py: Always create+select 90Hz modes on resize
+     - Discovers existing _90 modes from xrandr (regex includes suffixed names)
+     - Prefers existing 90Hz mode; generates new 90Hz via cvt if needed
+     - Falls back to 60Hz if cvt can't produce 90Hz modeline
+     - curr_res detection strips _90 suffix for comparison with browser-requested WxH
 """
 import re, sys
 
@@ -130,7 +130,7 @@ def patch_resize(path):
     assert old2 in src, "RPATCH2: return block not found"
     src = src.replace(old2, new2, 1)
 
-    # ---------- 3. resize_display: prefer 144Hz mode, generate 144Hz, fallback 60Hz ----------
+    # ---------- 3. resize_display: prefer 90Hz mode, generate 90Hz, fallback 60Hz ----------
     old3 = (
         '    logger.info("resizing display to %s" % res)\n'
         '    if res not in resolutions:\n'
@@ -159,16 +159,16 @@ def patch_resize(path):
     new3 = (
         '    logger.info("resizing display to %s" % res)\n'
         '\n'
-        '    # Strategy: prefer existing 144Hz mode → generate 144Hz → generate 60Hz → use base\n'
-        '    mode_144 = res + "_144"\n'
-        '    if mode_144 in resolutions:\n'
-        '        mode = mode_144\n'
-        '        logger.info("found existing 144Hz mode: %s" % mode)\n'
+        '    # Strategy: prefer existing 90Hz mode → generate 90Hz → generate 60Hz → use base\n'
+        '    mode_90 = res + "_90"\n'
+        '    if mode_90 in resolutions:\n'
+        '        mode = mode_90\n'
+        '        logger.info("found existing 90Hz mode: %s" % mode)\n'
         '    elif res not in resolutions:\n'
-        '        # Try generating a 144Hz mode first, fall back to 60Hz\n'
-        '        mode_hi, modeline_hi = generate_xrandr_gtf_modeline(res, refresh=144)\n'
+        '        # Try generating a 90Hz mode first, fall back to 60Hz\n'
+        '        mode_hi, modeline_hi = generate_xrandr_gtf_modeline(res, refresh=90)\n'
         '        if not modeline_hi:\n'
-        '            logger.warning("cvt failed for 144Hz, trying 60Hz")\n'
+        '            logger.warning("cvt failed for 90Hz, trying 60Hz")\n'
         '            mode_hi, modeline_hi = generate_xrandr_gtf_modeline(res, refresh=60)\n'
         '        if not modeline_hi:\n'
         '            logger.error("failed to generate any modeline for %s" % res)\n'
@@ -197,7 +197,7 @@ def patch_resize(path):
 
     # ---------- 4. generate_xrandr_gtf_modeline: accept refresh parameter ----------
     old4 = 'def generate_xrandr_gtf_modeline(res):'
-    new4 = 'def generate_xrandr_gtf_modeline(res, refresh=144):'
+    new4 = 'def generate_xrandr_gtf_modeline(res, refresh=90):'
     assert old4 in src, "RPATCH4: function signature not found"
     src = src.replace(old4, new4, 1)
 
@@ -226,7 +226,7 @@ def patch_resize(path):
 
 if __name__ == "__main__":
     base = "/home/vscode/.local/lib/python3.12/site-packages/selkies_gstreamer"
-    print("Applying robust NvFBC + 144Hz patches...")
+    print("Applying robust NvFBC + 90Hz patches...")
     patch_gstwebrtc_app(f"{base}/gstwebrtc_app.py")
     patch_resize(f"{base}/resize.py")
     print("Done.")
