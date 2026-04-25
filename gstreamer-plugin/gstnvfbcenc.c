@@ -3,12 +3,19 @@
  *
  * Architecture:
  *   NvFBC captures desktop → BGRA CUdeviceptr in VRAM
- *   NVENC encodes directly from the CUDA pointer → H265 bitstream
+ *   NVENC encodes directly from the CUDA pointer → H264 bitstream
  *   No cudaconvert, no GStreamer buffer copies, no intermediate elements
- *   Output: video/x-h265 stream-format=byte-stream
+ *   Output: video/x-h264 stream-format=byte-stream
  *
- * This eliminates GStreamer's cudaconvert + nvcudah265enc overhead,
+ * NVENC accepts BGRA (ARGB) input natively — does colorspace internally.
+ * This eliminates GStreamer's cudaconvert + nvcudah264enc overhead,
  * doing capture→encode in ~2 API calls on the GPU.
+ *
+ * Features:
+ *   - NOWAIT capture + wall-clock pacing (consistent fps, not screen-update limited)
+ *   - Force-keyframe via GStreamer event (PLI/FIR from WebRTC)
+ *   - Resolution change detection and encoder reinit
+ *   - VBV buffer sized for CBR stability (2× bitrate)
  */
 
 #include <gst/gst.h>
@@ -17,6 +24,7 @@
 
 #include <dlfcn.h>
 #include <string.h>
+#include <time.h>
 #include "NvFBC.h"
 #include "nvEncodeAPI.h"
 #include <cuda.h>
@@ -36,6 +44,7 @@ struct _GstNvfbcEnc {
     /* Properties */
     gint framerate;
     gint bitrate;       /* kbit/s */
+    gint vbv_buffer;    /* kbit, 0=auto (2× bitrate) */
     gboolean show_pointer;
     gboolean push_model;
 
@@ -53,15 +62,17 @@ struct _GstNvfbcEnc {
     NV_ENC_REGISTERED_PTR registered_res;
     NV_ENC_INPUT_PTR mapped_input;
     NV_ENC_OUTPUT_PTR output_bitstream;
+    CUdeviceptr last_fbc_ptr;   /* track if NvFBC pointer changes */
 
     /* CUDA */
     CUcontext cu_ctx;
     gboolean context_bound;
 
-    /* Timing */
+    /* Timing — NOWAIT + wall-clock pacing */
     GstClockTime base_time;
     guint64 frame_count;
     GstClockTime frame_duration;
+    gint64 next_capture_time;   /* monotonic usec deadline for NOWAIT pacing */
     gboolean need_keyframe;
 };
 
@@ -69,6 +80,7 @@ enum {
     PROP_0,
     PROP_FRAMERATE,
     PROP_BITRATE,
+    PROP_VBV_BUFFER,
     PROP_SHOW_POINTER,
     PROP_PUSH_MODEL,
 };
@@ -78,10 +90,10 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS(
-        "video/x-h265, "
+        "video/x-h264, "
         "stream-format = (string) byte-stream, "
         "alignment = (string) au, "
-        "profile = (string) main"
+        "profile = (string) { main, high }"
     )
 );
 
@@ -221,11 +233,11 @@ static gboolean create_nvenc_session(GstNvfbcEnc *self) {
         return FALSE;
     }
 
-    /* Initialize encoder — HEVC, CBR, low-latency */
+    /* Initialize encoder — H264, CBR, ultra-low-latency */
     NV_ENC_INITIALIZE_PARAMS initParams;
     memset(&initParams, 0, sizeof(initParams));
     initParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
-    initParams.encodeGUID = NV_ENC_CODEC_HEVC_GUID;
+    initParams.encodeGUID = NV_ENC_CODEC_H264_GUID;
     initParams.presetGUID = NV_ENC_PRESET_P4_GUID;
     initParams.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
     initParams.encodeWidth = self->width;
@@ -244,7 +256,7 @@ static gboolean create_nvenc_session(GstNvfbcEnc *self) {
     presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
 
     nst = self->nvenc_fn.nvEncGetEncodePresetConfigEx(self->nvenc_session,
-        NV_ENC_CODEC_HEVC_GUID, NV_ENC_PRESET_P4_GUID,
+        NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P4_GUID,
         NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &presetConfig);
     if (nst != NV_ENC_SUCCESS) {
         GST_ERROR_OBJECT(self, "nvEncGetEncodePresetConfigEx failed: %d", nst);
@@ -255,19 +267,25 @@ static gboolean create_nvenc_session(GstNvfbcEnc *self) {
     memcpy(&encConfig, &presetConfig.presetCfg, sizeof(encConfig));
     encConfig.version = NV_ENC_CONFIG_VER;
 
-    /* CBR rate control */
+    /* CBR rate control with proper VBV buffer */
+    guint32 vbv = self->vbv_buffer > 0 ? (guint32)(self->vbv_buffer * 1000)
+                                        : (guint32)(self->bitrate * 2000);
     encConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
     encConfig.rcParams.averageBitRate = self->bitrate * 1000;
     encConfig.rcParams.maxBitRate = self->bitrate * 1000;
-    encConfig.rcParams.vbvBufferSize = self->bitrate * 1000 / self->framerate;
-    encConfig.rcParams.vbvInitialDelay = encConfig.rcParams.vbvBufferSize;
+    encConfig.rcParams.vbvBufferSize = vbv;
+    encConfig.rcParams.vbvInitialDelay = vbv;
     encConfig.rcParams.zeroReorderDelay = 1;
     encConfig.rcParams.enableAQ = 0;
+    encConfig.rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
 
-    /* HEVC-specific: no B-frames, repeat SPS/PPS */
-    encConfig.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
-    encConfig.encodeCodecConfig.hevcConfig.idrPeriod = self->framerate * 2;
-    encConfig.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = 1;
+    /* H264-specific: Main profile, no B-frames, CABAC, repeat SPS/PPS */
+    encConfig.profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
+    encConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
+    encConfig.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+    encConfig.encodeCodecConfig.h264Config.maxNumRefFrames = 1;
+    encConfig.encodeCodecConfig.h264Config.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
+    encConfig.encodeCodecConfig.h264Config.disableSPSPPS = 0;
     encConfig.gopLength = NVENC_INFINITE_GOPLENGTH;
     encConfig.frameIntervalP = 1; /* no B-frames */
 
@@ -290,8 +308,8 @@ static gboolean create_nvenc_session(GstNvfbcEnc *self) {
     }
     self->output_bitstream = bsbParams.bitstreamBuffer;
 
-    GST_INFO_OBJECT(self, "NVENC H265 encoder initialized: %dx%d @ %dfps, %d kbps CBR",
-        self->width, self->height, self->framerate, self->bitrate);
+    GST_INFO_OBJECT(self, "NVENC H264 encoder initialized: %dx%d @ %dfps, %d kbps CBR, VBV %d kbits",
+        self->width, self->height, self->framerate, self->bitrate, vbv / 1000);
     return TRUE;
 }
 
@@ -368,7 +386,7 @@ static gboolean register_cuda_resource(GstNvfbcEnc *self, CUdeviceptr ptr) {
 static GstCaps *gst_nvfbc_enc_get_caps(GstBaseSrc *base, GstCaps *filter) {
     GstNvfbcEnc *self = GST_NVFBC_ENC(base);
 
-    GstCaps *caps = gst_caps_new_simple("video/x-h265",
+    GstCaps *caps = gst_caps_new_simple("video/x-h264",
         "stream-format", G_TYPE_STRING, "byte-stream",
         "alignment", G_TYPE_STRING, "au",
         "profile", G_TYPE_STRING, "main",
@@ -455,7 +473,7 @@ static gboolean gst_nvfbc_enc_start(GstBaseSrc *base) {
     self->need_keyframe = TRUE;
 
     /* Set caps on the pad */
-    GstCaps *caps = gst_caps_new_simple("video/x-h265",
+    GstCaps *caps = gst_caps_new_simple("video/x-h264",
         "stream-format", G_TYPE_STRING, "byte-stream",
         "alignment", G_TYPE_STRING, "au",
         "profile", G_TYPE_STRING, "main",
@@ -514,10 +532,23 @@ static GstFlowReturn gst_nvfbc_enc_create(GstPushSrc *pushsrc, GstBuffer **buf) 
         }
         cuCtxPushCurrent(self->cu_ctx);
         self->context_bound = TRUE;
+        self->next_capture_time = g_get_monotonic_time();
         GST_INFO_OBJECT(self, "NvFBC + CUDA context bound to streaming thread");
     }
 
-    /* ---- Step 1: NvFBC grab ---- */
+    /* ---- NOWAIT wall-clock pacing ---- */
+    gint64 now = g_get_monotonic_time();
+    gint64 sleep_us = self->next_capture_time - now;
+    if (sleep_us > 1000) {
+        g_usleep(sleep_us);
+    }
+    self->next_capture_time += GST_TIME_AS_USECONDS(self->frame_duration);
+    /* Don't let deadline drift too far behind */
+    now = g_get_monotonic_time();
+    if (self->next_capture_time < now - (gint64)500000)
+        self->next_capture_time = now;
+
+    /* ---- Step 1: NvFBC grab (NOWAIT — always returns immediately) ---- */
     CUdeviceptr fbc_ptr = 0;
     NVFBC_FRAME_GRAB_INFO grabInfo;
     memset(&grabInfo, 0, sizeof(grabInfo));
@@ -525,11 +556,10 @@ static GstFlowReturn gst_nvfbc_enc_create(GstPushSrc *pushsrc, GstBuffer **buf) 
     NVFBC_TOCUDA_GRAB_FRAME_PARAMS grabParams;
     memset(&grabParams, 0, sizeof(grabParams));
     grabParams.dwVersion = NVFBC_TOCUDA_GRAB_FRAME_PARAMS_VER;
-    grabParams.dwFlags = NVFBC_TOCUDA_GRAB_FLAGS_NOFLAGS;
+    grabParams.dwFlags = NVFBC_TOCUDA_GRAB_FLAGS_NOWAIT;
     grabParams.pCUDADeviceBuffer = &fbc_ptr;
     grabParams.pFrameGrabInfo = &grabInfo;
-    grabParams.dwTimeoutMs = GST_TIME_AS_MSECONDS(self->frame_duration) * 2;
-    if (grabParams.dwTimeoutMs < 16) grabParams.dwTimeoutMs = 16;
+    grabParams.dwTimeoutMs = 0;
 
     NVFBCSTATUS fbc_st = self->fbc_fn.nvFBCToCudaGrabFrame(self->fbc_handle, &grabParams);
     if (fbc_st != NVFBC_SUCCESS) {
@@ -545,13 +575,24 @@ static GstFlowReturn gst_nvfbc_enc_create(GstPushSrc *pushsrc, GstBuffer **buf) 
         self->width = grabInfo.dwWidth;
         self->height = grabInfo.dwHeight;
 
+        /* Unregister old resource */
+        if (self->mapped_input) {
+            self->nvenc_fn.nvEncUnmapInputResource(self->nvenc_session, self->mapped_input);
+            self->mapped_input = NULL;
+        }
+        if (self->registered_res) {
+            self->nvenc_fn.nvEncUnregisterResource(self->nvenc_session, self->registered_res);
+            self->registered_res = NULL;
+        }
+        self->last_fbc_ptr = 0;
+
         /* Recreate NVENC session with new resolution */
         destroy_nvenc_session(self);
         if (!create_nvenc_session(self))
             return GST_FLOW_ERROR;
 
         /* Update caps */
-        GstCaps *caps = gst_caps_new_simple("video/x-h265",
+        GstCaps *caps = gst_caps_new_simple("video/x-h264",
             "stream-format", G_TYPE_STRING, "byte-stream",
             "alignment", G_TYPE_STRING, "au",
             "profile", G_TYPE_STRING, "main",
@@ -564,10 +605,11 @@ static GstFlowReturn gst_nvfbc_enc_create(GstPushSrc *pushsrc, GstBuffer **buf) 
         self->need_keyframe = TRUE;
     }
 
-    /* Register CUDA pointer with NVENC (once, or on resolution change) */
-    if (!self->registered_res) {
+    /* Register CUDA pointer with NVENC (once, or if NvFBC pointer changes) */
+    if (!self->registered_res || fbc_ptr != self->last_fbc_ptr) {
         if (!register_cuda_resource(self, fbc_ptr))
             return GST_FLOW_ERROR;
+        self->last_fbc_ptr = fbc_ptr;
     }
 
     /* ---- Step 2: NVENC encode ---- */
@@ -685,11 +727,13 @@ static void gst_nvfbc_enc_finalize(GObject *obj) {
 
 static void gst_nvfbc_enc_init(GstNvfbcEnc *self) {
     self->framerate = 144;
-    self->bitrate = 20000;
+    self->bitrate = 25000;
+    self->vbv_buffer = 0;   /* auto = 2× bitrate */
     self->show_pointer = TRUE;
     self->push_model = TRUE;
     self->frame_duration = gst_util_uint64_scale_int(GST_SECOND, 1, 144);
     self->base_time = GST_CLOCK_TIME_NONE;
+    self->next_capture_time = 0;
     self->fbc_handle = 0;
     self->session_active = FALSE;
     self->context_bound = FALSE;
@@ -697,6 +741,7 @@ static void gst_nvfbc_enc_init(GstNvfbcEnc *self) {
     self->registered_res = NULL;
     self->mapped_input = NULL;
     self->output_bitstream = NULL;
+    self->last_fbc_ptr = 0;
     self->need_keyframe = TRUE;
     gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
     gst_base_src_set_live(GST_BASE_SRC(self), TRUE);
@@ -710,7 +755,8 @@ static void gst_nvfbc_enc_set_property(GObject *obj, guint id, const GValue *val
             self->framerate = g_value_get_int(val);
             self->frame_duration = gst_util_uint64_scale_int(GST_SECOND, 1, self->framerate);
             break;
-        case PROP_BITRATE: self->bitrate = g_value_get_int(val); break;
+        case PROP_BITRATE:     self->bitrate = g_value_get_int(val); break;
+        case PROP_VBV_BUFFER:  self->vbv_buffer = g_value_get_int(val); break;
         case PROP_SHOW_POINTER: self->show_pointer = g_value_get_boolean(val); break;
         case PROP_PUSH_MODEL:   self->push_model = g_value_get_boolean(val); break;
         default: G_OBJECT_WARN_INVALID_PROPERTY_ID(obj, id, pspec);
@@ -722,10 +768,26 @@ static void gst_nvfbc_enc_get_property(GObject *obj, guint id, GValue *val, GPar
     switch (id) {
         case PROP_FRAMERATE:    g_value_set_int(val, self->framerate); break;
         case PROP_BITRATE:      g_value_set_int(val, self->bitrate); break;
+        case PROP_VBV_BUFFER:   g_value_set_int(val, self->vbv_buffer); break;
         case PROP_SHOW_POINTER: g_value_set_boolean(val, self->show_pointer); break;
         case PROP_PUSH_MODEL:   g_value_set_boolean(val, self->push_model); break;
         default: G_OBJECT_WARN_INVALID_PROPERTY_ID(obj, id, pspec);
     }
+}
+
+/* Handle force-keyframe events from WebRTC (PLI/FIR) */
+static gboolean gst_nvfbc_enc_event(GstBaseSrc *base, GstEvent *event) {
+    GstNvfbcEnc *self = GST_NVFBC_ENC(base);
+
+    if (GST_EVENT_TYPE(event) == GST_EVENT_CUSTOM_UPSTREAM) {
+        const GstStructure *s = gst_event_get_structure(event);
+        if (s && gst_structure_has_name(s, "GstForceKeyUnit")) {
+            GST_INFO_OBJECT(self, "Force keyframe requested");
+            self->need_keyframe = TRUE;
+            return TRUE;
+        }
+    }
+    return GST_BASE_SRC_CLASS(gst_nvfbc_enc_parent_class)->event(base, event);
 }
 
 static void gst_nvfbc_enc_class_init(GstNvfbcEncClass *klass) {
@@ -743,7 +805,10 @@ static void gst_nvfbc_enc_class_init(GstNvfbcEncClass *klass) {
                          1, 240, 144, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
     g_object_class_install_property(gobject_class, PROP_BITRATE,
         g_param_spec_int("bitrate", "Bitrate", "Target bitrate in kbit/s",
-                         100, 200000, 20000, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+                         100, 200000, 25000, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    g_object_class_install_property(gobject_class, PROP_VBV_BUFFER,
+        g_param_spec_int("vbv-buffer-size", "VBV Buffer", "VBV buffer size in kbit (0=auto: 2× bitrate)",
+                         0, 500000, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
     g_object_class_install_property(gobject_class, PROP_SHOW_POINTER,
         g_param_spec_boolean("show-pointer", "Show Pointer",
                              "Show mouse pointer in capture",
@@ -757,13 +822,14 @@ static void gst_nvfbc_enc_class_init(GstNvfbcEncClass *klass) {
     gst_element_class_set_static_metadata(element_class,
         "NvFBC Capture + NVENC Encode",
         "Source/Video/Encoder",
-        "Zero-copy NvFBC capture with direct NVENC H265 encoding — no cudaconvert",
+        "Zero-copy NvFBC capture with direct NVENC H264 encoding — no cudaconvert",
         "Copilot");
 
     basesrc_class->get_caps = gst_nvfbc_enc_get_caps;
     basesrc_class->set_caps = gst_nvfbc_enc_set_caps;
     basesrc_class->start = gst_nvfbc_enc_start;
     basesrc_class->stop = gst_nvfbc_enc_stop;
+    basesrc_class->event = gst_nvfbc_enc_event;
     pushsrc_class->create = gst_nvfbc_enc_create;
 }
 
@@ -775,7 +841,7 @@ static gboolean plugin_init(GstPlugin *plugin) {
 GST_PLUGIN_DEFINE(
     GST_VERSION_MAJOR, GST_VERSION_MINOR,
     nvfbcenc,
-    "NvFBC zero-copy capture with direct NVENC H265 encoding",
+    "NvFBC zero-copy capture with direct NVENC H264 encoding",
     plugin_init,
     VERSION, "LGPL",
     PACKAGE, "https://github.com"
