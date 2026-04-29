@@ -276,7 +276,7 @@ class GSTWebRTCApp:
         # ADD_ENCODER: Add new encoder to this list and modify all locations with "ADD_ENCODER:"
         # Reference configuration for fixing when something is broken in web browsers:
         #   https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs/-/blob/main/net/webrtc/src/webrtcsink/imp.rs
-        if self.encoder in ["nvfbcenc"]:
+        if self.encoder in ["nvfbcenc", "nvfbchevc"]:
             # NvFBC + NVENC combined element — zero-copy capture→encode, no cudaconvert
             nvfbcenc = Gst.ElementFactory.make("nvfbcenc", "nvfbcenc")
             if nvfbcenc is None:
@@ -284,34 +284,61 @@ class GSTWebRTCApp:
             nvfbcenc.set_property("framerate", self.framerate)
             nvfbcenc.set_property("bitrate", self.fec_video_bitrate)
             nvfbcenc.set_property("show-pointer", True)
+            # Set codec: 0=H264, 1=HEVC
+            nvfbc_hevc = self.encoder == "nvfbchevc"
+            nvfbcenc.set_property("codec", 1 if nvfbc_hevc else 0)
             # nvfbcenc replaces ximagesrc — point self.ximagesrc to it for stop/start handlers
             self.ximagesrc = nvfbcenc
             self.using_nvfbc = True
 
-            # h264parse is needed to properly packetize NALUs for RTP
-            h264parse = Gst.ElementFactory.make("h264parse", "h264parse")
-            if h264parse is None:
-                raise GSTWebRTCAppError("h264parse element not found — install gst-plugins-bad")
-            h264parse.set_property("config-interval", -1)
+            if nvfbc_hevc:
+                # HEVC pipeline: h265parse + rtph265pay
+                h265parse = Gst.ElementFactory.make("h265parse", "h265parse")
+                if h265parse is None:
+                    raise GSTWebRTCAppError("h265parse element not found — install gst-plugins-bad")
+                h265parse.set_property("config-interval", -1)
 
-            # Create H264 RTP payloader
-            rtph264pay = Gst.ElementFactory.make("rtph264pay")
-            rtph264pay.set_property("mtu", 1200)
-            rtph264pay.set_property("aggregate-mode", "zero-latency")
-            rtph264pay.set_property("config-interval", -1)
-            extensions_return = self.rtp_add_extensions(rtph264pay)
-            if not extensions_return:
-                logger.warning("WebRTC RTP extension configuration failed with video")
-            rtph264pay_caps = Gst.caps_from_string("application/x-rtp")
-            rtph264pay_caps.set_value("media", "video")
-            rtph264pay_caps.set_value("clock-rate", 90000)
-            rtph264pay_caps.set_value("encoding-name", "H264")
-            rtph264pay_caps.set_value("payload", 97)
-            rtph264pay_caps.set_value("rtcp-fb-nack-pli", True)
-            rtph264pay_caps.set_value("rtcp-fb-ccm-fir", True)
-            rtph264pay_caps.set_value("rtcp-fb-x-gstreamer-fir-as-repair", True)
-            rtph264pay_capsfilter = Gst.ElementFactory.make("capsfilter")
-            rtph264pay_capsfilter.set_property("caps", rtph264pay_caps)
+                rtph265pay = Gst.ElementFactory.make("rtph265pay")
+                rtph265pay.set_property("mtu", 1200)
+                rtph265pay.set_property("aggregate-mode", "zero-latency")
+                rtph265pay.set_property("config-interval", -1)
+                extensions_return = self.rtp_add_extensions(rtph265pay)
+                if not extensions_return:
+                    logger.warning("WebRTC RTP extension configuration failed with video")
+                rtph265pay_caps = Gst.caps_from_string("application/x-rtp")
+                rtph265pay_caps.set_value("media", "video")
+                rtph265pay_caps.set_value("clock-rate", 90000)
+                rtph265pay_caps.set_value("encoding-name", "H265")
+                rtph265pay_caps.set_value("payload", 100)
+                rtph265pay_caps.set_value("rtcp-fb-nack-pli", True)
+                rtph265pay_caps.set_value("rtcp-fb-ccm-fir", True)
+                rtph265pay_caps.set_value("rtcp-fb-x-gstreamer-fir-as-repair", True)
+                rtph265pay_capsfilter = Gst.ElementFactory.make("capsfilter")
+                rtph265pay_capsfilter.set_property("caps", rtph265pay_caps)
+            else:
+                # H264 pipeline: h264parse + rtph264pay
+                h264parse = Gst.ElementFactory.make("h264parse", "h264parse")
+                if h264parse is None:
+                    raise GSTWebRTCAppError("h264parse element not found — install gst-plugins-bad")
+                h264parse.set_property("config-interval", -1)
+
+                rtph264pay = Gst.ElementFactory.make("rtph264pay")
+                rtph264pay.set_property("mtu", 1200)
+                rtph264pay.set_property("aggregate-mode", "zero-latency")
+                rtph264pay.set_property("config-interval", -1)
+                extensions_return = self.rtp_add_extensions(rtph264pay)
+                if not extensions_return:
+                    logger.warning("WebRTC RTP extension configuration failed with video")
+                rtph264pay_caps = Gst.caps_from_string("application/x-rtp")
+                rtph264pay_caps.set_value("media", "video")
+                rtph264pay_caps.set_value("clock-rate", 90000)
+                rtph264pay_caps.set_value("encoding-name", "H264")
+                rtph264pay_caps.set_value("payload", 97)
+                rtph264pay_caps.set_value("rtcp-fb-nack-pli", True)
+                rtph264pay_caps.set_value("rtcp-fb-ccm-fir", True)
+                rtph264pay_caps.set_value("rtcp-fb-x-gstreamer-fir-as-repair", True)
+                rtph264pay_capsfilter = Gst.ElementFactory.make("capsfilter")
+                rtph264pay_capsfilter.set_property("caps", rtph264pay_caps)
 
         elif self.encoder in ["nvh264enc"]:
             # Upload buffers from ximagesrc directly to CUDA memory where
@@ -997,9 +1024,12 @@ class GSTWebRTCApp:
         pipeline_elements = [self.ximagesrc, self.ximagesrc_capsfilter]
 
         # ADD_ENCODER: add new encoder elements to this list
-        if self.encoder in ["nvfbcenc"]:
+        if self.encoder in ["nvfbcenc", "nvfbchevc"]:
             # nvfbcenc IS the source — replaces ximagesrc + cudaconvert + encoder
-            pipeline_elements = [nvfbcenc, h264parse, rtph264pay, rtph264pay_capsfilter]
+            if self.encoder == "nvfbchevc":
+                pipeline_elements = [nvfbcenc, h265parse, rtph265pay, rtph265pay_capsfilter]
+            else:
+                pipeline_elements = [nvfbcenc, h264parse, rtph264pay, rtph264pay_capsfilter]
         elif self.encoder in ["nvh264enc"]:
             if self.using_nvfbc:
                 pipeline_elements += [cudaconvert, cudaconvert_capsfilter, nvh264enc, h264enc_capsfilter, rtph264pay, rtph264pay_capsfilter]
@@ -1262,7 +1292,7 @@ class GSTWebRTCApp:
         required = ["opus", "nice", "webrtc", "app", "dtls", "srtp", "rtp", "sctp", "rtpmanager", "ximagesrc"]
 
         # ADD_ENCODER: add new encoder to this list
-        supported = ["nvfbcenc", "nvh264enc", "nvh265enc", "nvav1enc", "vah264enc", "vah265enc", "vavp9enc", "vaav1enc", "x264enc", "openh264enc", "x265enc", "vp8enc", "vp9enc", "svtav1enc", "av1enc", "rav1enc"]
+        supported = ["nvfbcenc", "nvfbchevc", "nvh264enc", "nvh265enc", "nvav1enc", "vah264enc", "vah265enc", "vavp9enc", "vaav1enc", "x264enc", "openh264enc", "x265enc", "vp8enc", "vp9enc", "svtav1enc", "av1enc", "rav1enc"]
         if self.encoder not in supported:
             raise GSTWebRTCAppError('Unsupported encoder, must be one of: ' + ','.join(supported))
 
@@ -1271,7 +1301,7 @@ class GSTWebRTCApp:
             # rtpav1pay and rtpgccbwe are in gst-plugins-rs
             required.append("rsrtp")
 
-        if self.encoder.startswith("nv"):
+        if self.encoder.startswith("nv") and self.encoder not in ["nvfbcenc", "nvfbchevc"]:
             required.append("nvcodec")
 
         elif self.encoder.startswith("va"):
@@ -1356,10 +1386,10 @@ class GSTWebRTCApp:
             self.framerate = framerate
             # ADD_ENCODER: GOP/IDR Keyframe distance to keep the stream from freezing (in keyframe_dist seconds) and set vbv-buffer-size
             self.keyframe_frame_distance = -1 if self.keyframe_distance == -1.0 else max(self.min_keyframe_frame_distance, int(self.framerate * self.keyframe_distance))
-            if self.encoder in ["nvfbcenc"]:
+            if self.encoder in ["nvfbcenc", "nvfbchevc"]:
                 element = Gst.Bin.get_by_name(self.pipeline, "nvfbcenc")
                 element.set_property("framerate", self.framerate)
-            elif self.encoder.startswith("nv"):
+            elif self.encoder.startswith("nv") and self.encoder not in ["nvfbcenc", "nvfbchevc"]:
                 element = Gst.Bin.get_by_name(self.pipeline, "vaenc")
                 element.set_property("key-int-max", 1024 if self.keyframe_distance == -1.0 else self.keyframe_frame_distance)
                 element.set_property("cpb-size", int((self.fec_video_bitrate + self.framerate - 1) // self.framerate * self.vbv_multiplier_va))
@@ -1392,13 +1422,13 @@ class GSTWebRTCApp:
             else:
                 logger.warning("setting keyframe interval (GOP size) not supported with encoder: %s" % self.encoder)
 
-            if self.encoder in ["nvfbcenc"]:
+            if self.encoder in ["nvfbcenc", "nvfbchevc"]:
                 pass  # nvfbcenc handles caps internally
             elif self.using_nvfbc:
                 self.ximagesrc_caps = Gst.caps_from_string("video/x-raw(memory:CUDAMemory),format=BGRA")
             else:
                 self.ximagesrc_caps = Gst.caps_from_string("video/x-raw")
-            if self.encoder not in ["nvfbcenc"]:
+            if self.encoder not in ["nvfbcenc", "nvfbchevc"]:
                 self.ximagesrc_caps.set_value("framerate", Gst.Fraction(self.framerate, 1))
                 self.ximagesrc_capsfilter.set_property("caps", self.ximagesrc_caps)
             logger.info("framerate set to: %d" % framerate)
@@ -1421,10 +1451,10 @@ class GSTWebRTCApp:
                 self.rtpgccbwe.set_property("max-bitrate", int(bitrate * 1000 + self.fec_audio_bitrate))
                 self.rtpgccbwe.set_property("estimated-bitrate", int(bitrate * 1000 + self.fec_audio_bitrate))
             # ADD_ENCODER: add new encoder to this list and set vbv-buffer-size if unit is bytes instead of milliseconds
-            if self.encoder in ["nvfbcenc"]:
+            if self.encoder in ["nvfbcenc", "nvfbchevc"]:
                 element = Gst.Bin.get_by_name(self.pipeline, "nvfbcenc")
                 element.set_property("bitrate", fec_bitrate)
-            elif self.encoder.startswith("nv"):
+            elif self.encoder.startswith("nv") and self.encoder not in ["nvfbcenc", "nvfbchevc"]:
                 element = Gst.Bin.get_by_name(self.pipeline, "nvenc")
                 if not cc:
                     element.set_property("vbv-buffer-size", fec_bitrate * 2)
