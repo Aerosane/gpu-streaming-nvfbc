@@ -3,9 +3,9 @@
  *
  * Architecture:
  *   NvFBC captures desktop → BGRA CUdeviceptr in VRAM
- *   NVENC encodes directly from the CUDA pointer → H264 bitstream
+ *   NVENC encodes directly from the CUDA pointer → H264/HEVC bitstream
  *   No cudaconvert, no GStreamer buffer copies, no intermediate elements
- *   Output: video/x-h264 stream-format=byte-stream
+ *   Output: video/x-h264 or video/x-h265 stream-format=byte-stream
  *
  * NVENC accepts BGRA (ARGB) input natively — does colorspace internally.
  * This eliminates GStreamer's cudaconvert + nvcudah264enc overhead,
@@ -47,6 +47,7 @@ struct _GstNvfbcEnc {
     gint vbv_buffer;    /* kbit, 0=auto (2× bitrate) */
     gboolean show_pointer;
     gboolean push_model;
+    gint codec;         /* 0=h264, 1=h265 */
 
     /* NvFBC state */
     void *fbc_lib;
@@ -83,6 +84,7 @@ enum {
     PROP_VBV_BUFFER,
     PROP_SHOW_POINTER,
     PROP_PUSH_MODEL,
+    PROP_CODEC,
 };
 
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
@@ -93,11 +95,19 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
         "video/x-h264, "
         "stream-format = (string) byte-stream, "
         "alignment = (string) au, "
-        "profile = (string) { main, high }"
+        "profile = (string) { main, high }; "
+        "video/x-h265, "
+        "stream-format = (string) byte-stream, "
+        "alignment = (string) au, "
+        "profile = (string) { main }"
     )
 );
 
 G_DEFINE_TYPE(GstNvfbcEnc, gst_nvfbc_enc, GST_TYPE_PUSH_SRC);
+
+static inline const gchar *codec_media_type(gint codec) {
+    return (codec == 1) ? "video/x-h265" : "video/x-h264";
+}
 
 /* ======================== NvFBC helpers ======================== */
 
@@ -233,11 +243,14 @@ static gboolean create_nvenc_session(GstNvfbcEnc *self) {
         return FALSE;
     }
 
-    /* Initialize encoder — H264, CBR, ultra-low-latency */
+    /* Initialize encoder — codec selected by property, CBR, ultra-low-latency */
+    gboolean is_hevc = (self->codec == 1);
+    GUID codecGUID = is_hevc ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
+
     NV_ENC_INITIALIZE_PARAMS initParams;
     memset(&initParams, 0, sizeof(initParams));
     initParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
-    initParams.encodeGUID = NV_ENC_CODEC_H264_GUID;
+    initParams.encodeGUID = codecGUID;
     initParams.presetGUID = NV_ENC_PRESET_P7_GUID;
     initParams.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
     initParams.encodeWidth = self->width;
@@ -256,7 +269,7 @@ static gboolean create_nvenc_session(GstNvfbcEnc *self) {
     presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
 
     nst = self->nvenc_fn.nvEncGetEncodePresetConfigEx(self->nvenc_session,
-        NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P7_GUID,
+        codecGUID, NV_ENC_PRESET_P7_GUID,
         NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &presetConfig);
     if (nst != NV_ENC_SUCCESS) {
         GST_ERROR_OBJECT(self, "nvEncGetEncodePresetConfigEx failed: %d", nst);
@@ -279,13 +292,21 @@ static gboolean create_nvenc_session(GstNvfbcEnc *self) {
     encConfig.rcParams.enableAQ = 1;
     encConfig.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
 
-    /* H264-specific: Main profile, no B-frames, CABAC, repeat SPS/PPS */
-    encConfig.profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
-    encConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
-    encConfig.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
-    encConfig.encodeCodecConfig.h264Config.maxNumRefFrames = 1;
-    encConfig.encodeCodecConfig.h264Config.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
-    encConfig.encodeCodecConfig.h264Config.disableSPSPPS = 0;
+    /* Codec-specific config: profile, no B-frames, repeat headers */
+    if (is_hevc) {
+        encConfig.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
+        encConfig.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
+        encConfig.encodeCodecConfig.hevcConfig.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+        encConfig.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = 1;
+        encConfig.encodeCodecConfig.hevcConfig.disableSPSPPS = 0;
+    } else {
+        encConfig.profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
+        encConfig.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
+        encConfig.encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+        encConfig.encodeCodecConfig.h264Config.maxNumRefFrames = 1;
+        encConfig.encodeCodecConfig.h264Config.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
+        encConfig.encodeCodecConfig.h264Config.disableSPSPPS = 0;
+    }
     encConfig.gopLength = NVENC_INFINITE_GOPLENGTH;
     encConfig.frameIntervalP = 1; /* no B-frames */
 
@@ -308,7 +329,8 @@ static gboolean create_nvenc_session(GstNvfbcEnc *self) {
     }
     self->output_bitstream = bsbParams.bitstreamBuffer;
 
-    GST_INFO_OBJECT(self, "NVENC H264 encoder initialized: %dx%d @ %dfps, %d kbps CBR, VBV %d kbits",
+    GST_INFO_OBJECT(self, "NVENC %s encoder initialized: %dx%d @ %dfps, %d kbps CBR, VBV %d kbits",
+        is_hevc ? "HEVC" : "H264",
         self->width, self->height, self->framerate, self->bitrate, vbv / 1000);
     return TRUE;
 }
@@ -386,7 +408,7 @@ static gboolean register_cuda_resource(GstNvfbcEnc *self, CUdeviceptr ptr) {
 static GstCaps *gst_nvfbc_enc_get_caps(GstBaseSrc *base, GstCaps *filter) {
     GstNvfbcEnc *self = GST_NVFBC_ENC(base);
 
-    GstCaps *caps = gst_caps_new_simple("video/x-h264",
+    GstCaps *caps = gst_caps_new_simple(codec_media_type(self->codec),
         "stream-format", G_TYPE_STRING, "byte-stream",
         "alignment", G_TYPE_STRING, "au",
         "profile", G_TYPE_STRING, "main",
@@ -473,7 +495,7 @@ static gboolean gst_nvfbc_enc_start(GstBaseSrc *base) {
     self->need_keyframe = TRUE;
 
     /* Set caps on the pad */
-    GstCaps *caps = gst_caps_new_simple("video/x-h264",
+    GstCaps *caps = gst_caps_new_simple(codec_media_type(self->codec),
         "stream-format", G_TYPE_STRING, "byte-stream",
         "alignment", G_TYPE_STRING, "au",
         "profile", G_TYPE_STRING, "main",
@@ -619,7 +641,7 @@ static GstFlowReturn gst_nvfbc_enc_create(GstPushSrc *pushsrc, GstBuffer **buf) 
             return GST_FLOW_ERROR;
 
         /* Update caps */
-        GstCaps *caps = gst_caps_new_simple("video/x-h264",
+        GstCaps *caps = gst_caps_new_simple(codec_media_type(self->codec),
             "stream-format", G_TYPE_STRING, "byte-stream",
             "alignment", G_TYPE_STRING, "au",
             "profile", G_TYPE_STRING, "main",
@@ -758,6 +780,7 @@ static void gst_nvfbc_enc_init(GstNvfbcEnc *self) {
     self->vbv_buffer = 0;   /* auto = 2× bitrate */
     self->show_pointer = TRUE;
     self->push_model = TRUE;
+    self->codec = 0;        /* default H264 */
     self->frame_duration = gst_util_uint64_scale_int(GST_SECOND, 1, 144);
     self->base_time = GST_CLOCK_TIME_NONE;
     self->next_capture_time = 0;
@@ -786,6 +809,7 @@ static void gst_nvfbc_enc_set_property(GObject *obj, guint id, const GValue *val
         case PROP_VBV_BUFFER:  self->vbv_buffer = g_value_get_int(val); break;
         case PROP_SHOW_POINTER: self->show_pointer = g_value_get_boolean(val); break;
         case PROP_PUSH_MODEL:   self->push_model = g_value_get_boolean(val); break;
+        case PROP_CODEC:        self->codec = g_value_get_int(val); break;
         default: G_OBJECT_WARN_INVALID_PROPERTY_ID(obj, id, pspec);
     }
 }
@@ -798,6 +822,7 @@ static void gst_nvfbc_enc_get_property(GObject *obj, guint id, GValue *val, GPar
         case PROP_VBV_BUFFER:   g_value_set_int(val, self->vbv_buffer); break;
         case PROP_SHOW_POINTER: g_value_set_boolean(val, self->show_pointer); break;
         case PROP_PUSH_MODEL:   g_value_set_boolean(val, self->push_model); break;
+        case PROP_CODEC:        g_value_set_int(val, self->codec); break;
         default: G_OBJECT_WARN_INVALID_PROPERTY_ID(obj, id, pspec);
     }
 }
@@ -844,12 +869,16 @@ static void gst_nvfbc_enc_class_init(GstNvfbcEncClass *klass) {
         g_param_spec_boolean("push-model", "Push Model",
                              "Enable push model (event-driven capture)",
                              TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    g_object_class_install_property(gobject_class, PROP_CODEC,
+        g_param_spec_int("codec", "Codec",
+                         "Video codec (0=H264, 1=H265/HEVC)",
+                         0, 1, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
     gst_element_class_add_static_pad_template(element_class, &src_template);
     gst_element_class_set_static_metadata(element_class,
         "NvFBC Capture + NVENC Encode",
         "Source/Video/Encoder",
-        "Zero-copy NvFBC capture with direct NVENC H264 encoding — no cudaconvert",
+        "Zero-copy NvFBC capture with direct NVENC H264/HEVC encoding — no cudaconvert",
         "Copilot");
 
     basesrc_class->get_caps = gst_nvfbc_enc_get_caps;
@@ -868,7 +897,7 @@ static gboolean plugin_init(GstPlugin *plugin) {
 GST_PLUGIN_DEFINE(
     GST_VERSION_MAJOR, GST_VERSION_MINOR,
     nvfbcenc,
-    "NvFBC zero-copy capture with direct NVENC H264 encoding",
+    "NvFBC zero-copy capture with direct NVENC H264/HEVC encoding",
     plugin_init,
     VERSION, "LGPL",
     PACKAGE, "https://github.com"
