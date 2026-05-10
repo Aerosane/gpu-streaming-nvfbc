@@ -86,11 +86,19 @@ struct selkies_config {
 #define XBOX_PRODUCT 0x028e
 #define XBOX_VERSION 0x0110
 
+/* W3C Standard Gamepad button mapping:
+ * 0=A 1=B 2=X 3=Y 4=LB 5=RB 6=LT 7=RT
+ * 8=Back 9=Start 10=L3 11=R3
+ * 12=DUp 13=DDown 14=DLeft 15=DRight 16=Guide
+ * Triggers (6,7) and D-pad (12-15) handled as axes in process_event */
 static const int btn_map[] = {
-    BTN_A, BTN_B, BTN_X, BTN_Y,
-    BTN_TL, BTN_TR,
-    BTN_SELECT, BTN_START, BTN_MODE,
-    BTN_THUMBL, BTN_THUMBR,
+    BTN_A, BTN_B, BTN_X, BTN_Y,        /* 0-3  */
+    BTN_TL, BTN_TR,                     /* 4-5  */
+    -1, -1,                             /* 6-7  triggers → axis */
+    BTN_SELECT, BTN_START,              /* 8-9  */
+    BTN_THUMBL, BTN_THUMBR,            /* 10-11 */
+    -1, -1, -1, -1,                     /* 12-15 dpad → axis */
+    BTN_MODE,                           /* 16   Guide/Xbox */
 };
 #define NUM_BTNS (sizeof(btn_map) / sizeof(btn_map[0]))
 
@@ -199,12 +207,47 @@ static inline void uinput_syn(int fd)
 static inline void process_event(int ui_fd, int type, int number, int value,
                                  int *event_count)
 {
-    if (type == GP_TYPE_BUTTON && (size_t)number < NUM_BTNS) {
-        uinput_emit(ui_fd, EV_KEY, btn_map[number], value);
-        uinput_syn(ui_fd);
-        if (value && *event_count < 5) {
-            printf(TAG "Button %d pressed (code %d)\n", number, btn_map[number]);
-            (*event_count)++;
+    if (type == GP_TYPE_BUTTON) {
+        /* Trigger buttons → axis (6=LT→ABS_Z, 7=RT→ABS_RZ) */
+        if (number == 6) {
+            uinput_emit(ui_fd, EV_ABS, ABS_Z, value ? 255 : 0);
+            uinput_syn(ui_fd);
+            return;
+        }
+        if (number == 7) {
+            uinput_emit(ui_fd, EV_ABS, ABS_RZ, value ? 255 : 0);
+            uinput_syn(ui_fd);
+            return;
+        }
+        /* D-pad buttons → HAT axis (12=Up,13=Down,14=Left,15=Right) */
+        if (number == 12) {
+            uinput_emit(ui_fd, EV_ABS, ABS_HAT0Y, value ? -1 : 0);
+            uinput_syn(ui_fd);
+            return;
+        }
+        if (number == 13) {
+            uinput_emit(ui_fd, EV_ABS, ABS_HAT0Y, value ? 1 : 0);
+            uinput_syn(ui_fd);
+            return;
+        }
+        if (number == 14) {
+            uinput_emit(ui_fd, EV_ABS, ABS_HAT0X, value ? -1 : 0);
+            uinput_syn(ui_fd);
+            return;
+        }
+        if (number == 15) {
+            uinput_emit(ui_fd, EV_ABS, ABS_HAT0X, value ? 1 : 0);
+            uinput_syn(ui_fd);
+            return;
+        }
+        /* Regular buttons */
+        if ((size_t)number < NUM_BTNS && btn_map[number] >= 0) {
+            uinput_emit(ui_fd, EV_KEY, btn_map[number], value);
+            uinput_syn(ui_fd);
+            if (value && *event_count < 5) {
+                printf(TAG "Button %d pressed (code %d)\n", number, btn_map[number]);
+                (*event_count)++;
+            }
         }
     } else if (type == GP_TYPE_AXIS && (size_t)number < NUM_AXES) {
         uinput_emit(ui_fd, EV_ABS, axis_map[number], value);
